@@ -1,1 +1,4 @@
 /target
+
+# Mjolnir linked worktrees
+.mjolnir/worktrees/
