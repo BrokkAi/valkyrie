@@ -49,7 +49,10 @@ pub fn write_target(paths: &RunPaths, target: &Target) -> AppResult<()> {
 }
 
 pub fn write_effective_settings(paths: &RunPaths, settings: &EffectiveSettings) -> AppResult<()> {
-    fs::write(&paths.effective_settings_json, effective_settings_json(settings))?;
+    fs::write(
+        &paths.effective_settings_json,
+        effective_settings_json(settings),
+    )?;
     Ok(())
 }
 
@@ -66,7 +69,8 @@ pub fn write_event(paths: &RunPaths, name: &str, message: &str) -> AppResult<()>
     };
 
     existing.push_str(&format!(
-        "{{\"event\":\"{}\",\"message\":\"{}\"}}\n",
+        "{{\"timestamp\":\"{}\",\"event\":\"{}\",\"message\":\"{}\"}}\n",
+        unix_timestamp_millis(),
         escape_json(name),
         escape_json(message)
     ));
@@ -160,8 +164,15 @@ fn generate_run_id(target: &Target) -> String {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
-        .as_secs();
+        .as_millis();
     format!("run-{stamp}-{}", target.slug())
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis()
 }
 
 fn target_json(target: &Target) -> String {
@@ -170,10 +181,9 @@ fn target_json(target: &Target) -> String {
             "{{\n  \"kind\": \"local_task\",\n  \"prompt\": \"{}\"\n}}\n",
             escape_json(prompt)
         ),
-        Target::Issue { number } => format!(
-            "{{\n  \"kind\": \"issue\",\n  \"number\": {}\n}}\n",
-            number
-        ),
+        Target::Issue { number } => {
+            format!("{{\n  \"kind\": \"issue\",\n  \"number\": {}\n}}\n", number)
+        }
         Target::PullRequest { number, fix } => format!(
             "{{\n  \"kind\": \"pull_request\",\n  \"number\": {},\n  \"fix\": {}\n}}\n",
             number, fix

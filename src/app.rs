@@ -23,8 +23,9 @@ pub fn run() -> AppResult<()> {
         | Command::Issue(request)
         | Command::PullRequest(request)
         | Command::Ci(request) => {
+            let json = request.options.json;
             let result = execute_run(request)?;
-            print_run_result(&result);
+            print_run_result(&result, json);
         }
         Command::Status(run_id) => {
             let repo_path = current_repo_path()?;
@@ -64,11 +65,7 @@ pub fn run() -> AppResult<()> {
 }
 
 fn execute_run(request: RunRequest) -> AppResult<RunResult> {
-    let repo_path = request
-        .options
-        .repo
-        .clone()
-        .unwrap_or(current_repo_path()?);
+    let repo_path = request.options.repo.clone().unwrap_or(current_repo_path()?);
     let repo_path = repo_path.canonicalize().unwrap_or(repo_path);
 
     let settings = resolve_settings(repo_path.clone(), &request.options)?;
@@ -118,7 +115,11 @@ fn execute_run(request: RunRequest) -> AppResult<RunResult> {
 
     write_summary(&paths, &result, &settings, &validation)?;
     write_result(&paths, &result)?;
-    write_event(&paths, "run_finished", &format!("run finished with {}", result.state))?;
+    write_event(
+        &paths,
+        "run_finished",
+        &format!("run finished with {}", result.state),
+    )?;
 
     Ok(result)
 }
@@ -185,14 +186,27 @@ fn handle_defaults(command: DefaultsCommand) -> AppResult<()> {
 
 fn print_status(repo_path: &Path, run_id: &str) -> AppResult<()> {
     let run_path = resolve_run_path(repo_path, run_id)?;
-    let result = read_text(&run_path.join("result.json"))?;
+    let result_path = run_path.join("result.json");
+    let result = read_text(&result_path)?;
     let summary = read_text(&run_path.join("summary.md"))?;
+    println!("Run record: {}", result_path.display());
     println!("{result}");
     println!("{summary}");
     Ok(())
 }
 
-fn print_run_result(result: &RunResult) {
+fn print_run_result(result: &RunResult, json: bool) {
+    if json {
+        println!(
+            "{{\"run_id\":\"{}\",\"state\":\"{}\",\"target\":\"{}\",\"summary\":\"{}\"}}",
+            escape_json(&result.run_id),
+            result.state,
+            escape_json(&result.target.display_name()),
+            escape_json(&result.summary),
+        );
+        return;
+    }
+
     println!("Run: {}", result.run_id);
     println!("Target: {}", result.target.display_name());
     println!("State: {}", result.state);
@@ -200,11 +214,32 @@ fn print_run_result(result: &RunResult) {
 }
 
 fn current_repo_path() -> AppResult<PathBuf> {
-    Ok(env::current_dir()?)
+    let cwd = env::current_dir()?;
+    Ok(find_repo_root(&cwd).unwrap_or(cwd))
 }
 
 fn to_boxed_error(message: String) -> Box<dyn std::error::Error> {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
+}
+
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        if path.join(".git").exists() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 #[cfg(test)]
@@ -215,7 +250,7 @@ mod tests {
     use crate::cli::{RunOptions, RunRequest};
     use crate::model::{Target, WriteMode};
 
-    use super::execute_run;
+    use super::{execute_run, find_repo_root};
 
     #[test]
     fn execute_run_creates_artifacts() {
@@ -247,6 +282,17 @@ mod tests {
         let settings = crate::defaults::resolve_settings(repo_path, &RunOptions::default())
             .expect("settings resolve");
         assert_eq!(settings.write_mode, WriteMode::LocalPatch);
+    }
+
+    #[test]
+    fn finds_repo_root_from_nested_directory() {
+        let root = unique_temp_dir("repo-root");
+        let nested = root.join("src/bin");
+        fs::create_dir_all(&nested).expect("create nested");
+        fs::create_dir_all(root.join(".git")).expect("create fake git dir");
+
+        let found = find_repo_root(&nested).expect("finds root");
+        assert_eq!(found, root);
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

@@ -24,12 +24,14 @@ pub fn build_plan(target: &Target, settings: &EffectiveSettings, repo_path: &Pat
     };
 
     format!(
-        "# Plan\n\n## Problem statement\n\n- Target: {}\n- Repo: {}\n- Write mode: {}\n- Max iterations: {}\n- Max files changed: {}\n\n## Relevant files\n\n{}\n\n## Proposed changes\n\n- Create or update a bounded implementation for this target.\n- Persist a run record under `.valkyrie/runs/<run-id>`.\n- Capture validation, summary, and result metadata for later inspection.\n{}\n## Validation steps\n\n{}\n\n## Risks\n\n- The agent execution layer is not yet connected to anvil.\n- Remote targets need GitHub metadata resolution before autonomous code changes can be applied.\n- Validation commands are inferred heuristically when no explicit defaults exist.\n\n## Stop conditions\n\n- Stop if the workspace cannot be prepared.\n- Stop if validation repeatedly fails.\n- Stop if configured file-change or iteration limits are exceeded.\n",
+        "# Plan\n\n## Problem statement\n\n- Target: {}\n- Repo: {}\n- Write mode: {}\n- Max iterations: {}\n- Max files changed: {}\n- Base branch: {} ({})\n\n## Relevant files\n\n{}\n\n## Proposed changes\n\n- Create or update a bounded implementation for this target.\n- Persist a run record under `.valkyrie/runs/<run-id>`.\n- Capture validation, summary, and result metadata for later inspection.\n{}\n## Validation steps\n\n{}\n\n## Risks\n\n- The agent execution layer is not yet connected to anvil.\n- Remote targets need GitHub metadata resolution before autonomous code changes can be applied.\n- Validation commands are inferred heuristically when no explicit defaults exist.\n\n## Stop conditions\n\n- Stop if the workspace cannot be prepared.\n- Stop if validation repeatedly fails.\n- Stop if configured file-change or iteration limits are exceeded.\n",
         target.display_name(),
         repo_path.display(),
         settings.write_mode,
         settings.max_iterations.value,
         settings.max_files_changed.value,
+        settings.base_branch.value,
+        settings.base_branch.source,
         relevant_files
             .iter()
             .map(|path| format!("- {}", path.display()))

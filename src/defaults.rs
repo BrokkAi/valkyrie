@@ -568,7 +568,10 @@ fn is_multi_value_key(key: &str) -> bool {
 }
 
 fn yaml_scalar(value: &str) -> String {
-    if value.chars().all(|item| item.is_ascii_alphanumeric() || matches!(item, '-' | '_' | '.')) {
+    if value
+        .chars()
+        .all(|item| item.is_ascii_alphanumeric() || matches!(item, '-' | '_' | '.'))
+    {
         value.to_string()
     } else {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
@@ -595,8 +598,14 @@ mod tests {
         defaults.save(&path).expect("save");
 
         let loaded = DefaultsFile::load(&path).expect("load");
-        assert_eq!(loaded.get("repo.base").expect("repo base"), &vec!["main".to_string()]);
-        assert_eq!(loaded.get("validation.command").expect("validation").len(), 2);
+        assert_eq!(
+            loaded.get("repo.base").expect("repo base"),
+            &vec!["main".to_string()]
+        );
+        assert_eq!(
+            loaded.get("validation.command").expect("validation").len(),
+            2
+        );
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

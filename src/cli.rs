@@ -311,16 +311,25 @@ fn parse_run_options(tokens: &[String]) -> CliResult<RunOptions> {
             "--update-pr" => options.update_pr = true,
             "--post-comment" => options.post_comment = true,
             "--max-iterations" => {
-                options.max_iterations =
-                    Some(read_value(tokens, &mut index)?.parse().map_err(invalid_number)?)
+                options.max_iterations = Some(
+                    read_value(tokens, &mut index)?
+                        .parse()
+                        .map_err(invalid_number)?,
+                )
             }
             "--max-files" => {
-                options.max_files =
-                    Some(read_value(tokens, &mut index)?.parse().map_err(invalid_number)?)
+                options.max_files = Some(
+                    read_value(tokens, &mut index)?
+                        .parse()
+                        .map_err(invalid_number)?,
+                )
             }
             "--timeout" => {
-                options.timeout_minutes =
-                    Some(read_value(tokens, &mut index)?.parse().map_err(invalid_number)?)
+                options.timeout_minutes = Some(
+                    read_value(tokens, &mut index)?
+                        .parse()
+                        .map_err(invalid_number)?,
+                )
             }
             "--budget" => options.budget = Some(read_value(tokens, &mut index)?),
             "--validate" => options
