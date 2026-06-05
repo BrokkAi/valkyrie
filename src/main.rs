@@ -1053,15 +1053,12 @@ fn gh_issue_view(number: &str, repo: &Path) -> Result<String, String> {
     }
 }
 
+const GH_PR_VIEW_JSON_FIELDS: &str =
+    "title,body,comments,reviews,url,state,author,headRefName,baseRefName";
+
 fn gh_pr_view(number: &str, repo: &Path) -> Result<String, String> {
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            number,
-            "--json",
-            "title,body,comments,reviews,reviewThreads,url,state,author,headRefName,baseRefName",
-        ])
+        .args(["pr", "view", number, "--json", GH_PR_VIEW_JSON_FIELDS])
         .current_dir(repo)
         .output()
         .map_err(|error| format!("cannot run gh: {error}"))?;
@@ -1530,6 +1527,13 @@ mod tests {
         assert!(markdown.contains("gh is unavailable"));
         assert!(markdown.contains("Raw target metadata was captured"));
         assert!(!markdown.contains("issue.json"));
+    }
+
+    #[test]
+    fn gh_pr_view_fields_do_not_include_unsupported_review_threads() {
+        assert!(GH_PR_VIEW_JSON_FIELDS.contains("reviews"));
+        assert!(GH_PR_VIEW_JSON_FIELDS.contains("comments"));
+        assert!(!GH_PR_VIEW_JSON_FIELDS.contains("reviewThreads"));
     }
 
     #[test]
