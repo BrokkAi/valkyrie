@@ -96,8 +96,18 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     if plan_only || settings.write_mode == WriteMode::NoWrite {
         write_text(run_dir.join("diff.patch"), "")?;
         write_text(
+            run_dir.join("validation.md"),
+            "# Validation
+
+Validation was not run because this was a planning/no-write run.
+",
+        )?;
+        write_text(
             run_dir.join("summary.md"),
-            "# Summary\n\nPlanning completed. No files were modified by Valkyrie.\n",
+            "# Summary
+
+Planning completed. No files were modified by Valkyrie.
+",
         )?;
         write_text(
             run_dir.join("result.json"),
@@ -112,18 +122,54 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
 
     let diff = git_output(&repo, &["diff", "--"])?;
     write_text(run_dir.join("diff.patch"), &diff)?;
+
+    let validation = run_validation(&repo, &settings)?;
+    write_text(run_dir.join("validation.md"), &validation.to_markdown())?;
+    let state = if validation.failed() {
+        "failed"
+    } else if validation.skipped {
+        "planned"
+    } else {
+        "validated"
+    };
+
     write_text(
         run_dir.join("summary.md"),
-        "# Summary\n\nRun record created. Agent execution is not wired yet; this MVP skeleton records the target, settings, plan, logs, and current diff.\n",
+        &format!(
+            "# Summary
+
+Run record created. Agent execution is not wired yet; this MVP skeleton records the target, settings, plan, logs, current diff, and validation result.
+
+Validation state: `{state}`.
+"
+        ),
     )?;
     write_text(
         run_dir.join("result.json"),
         &format!(
-            "{{\n  \"run_id\": \"{}\",\n  \"state\": \"planned\",\n  \"run_dir\": \"{}\",\n  \"agent_invoked\": false\n}}\n",
+            r#"{{
+  "run_id": "{}",
+  "state": "{}",
+  "run_dir": "{}",
+  "agent_invoked": false,
+  "validation": {{ "skipped": {}, "failed": {} }}
+}}
+"#,
             escape_json(&run_id),
-            escape_json(&run_dir.display().to_string())
+            state,
+            escape_json(&run_dir.display().to_string()),
+            validation.skipped,
+            validation.failed()
         ),
     )?;
+
+    if validation.failed() {
+        return Err(format!(
+            "validation failed for run `{}`. See `{}`",
+            run_id,
+            run_dir.join("validation.md").display()
+        ));
+    }
 
     Ok(())
 }
@@ -250,6 +296,7 @@ struct ParsedRun {
     post_comment: bool,
     json: bool,
     verbose: bool,
+    skip_validation: bool,
     validations: Vec<String>,
 }
 
@@ -266,6 +313,7 @@ impl ParsedRun {
         let mut post_comment = false;
         let mut json = false;
         let mut verbose = false;
+        let mut skip_validation = false;
         let mut validations = Vec::new();
 
         let mut iter = args.into_iter();
@@ -282,6 +330,7 @@ impl ParsedRun {
                 "--post-comment" => post_comment = true,
                 "--json" => json = true,
                 "--verbose" => verbose = true,
+                "--skip-validation" => skip_validation = true,
                 flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
                 value => task_parts.push(value.to_string()),
             }
@@ -303,6 +352,7 @@ impl ParsedRun {
             post_comment,
             json,
             verbose,
+            skip_validation,
             validations,
         })
     }
@@ -579,6 +629,7 @@ impl WriteMode {
 
 struct EffectiveSettings {
     validation: Vec<Resolved<String>>,
+    skip_validation: Resolved<bool>,
     write_mode: WriteMode,
     write_mode_source: String,
     commit: Resolved<bool>,
@@ -590,17 +641,27 @@ struct EffectiveSettings {
 
 impl EffectiveSettings {
     fn from_inputs(parsed: &ParsedRun, defaults: &DefaultsResolver) -> Self {
+        let skip_validation = if parsed.skip_validation {
+            Resolved::new(true, "cli")
+        } else {
+            defaults
+                .bool("validation.skip")
+                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
+        };
+
         let mut validation = Vec::new();
-        for command in &parsed.validations {
-            validation.push(Resolved::new(command.clone(), "cli"));
-        }
-        if validation.is_empty() {
-            if let Some(command) = defaults.get("validation.command") {
-                validation.push(command);
+        if !skip_validation.value {
+            for command in &parsed.validations {
+                validation.push(Resolved::new(command.clone(), "cli"));
             }
-        }
-        if validation.is_empty() {
-            validation.push(Resolved::new(infer_validation_command(), "inferred"));
+            if validation.is_empty() {
+                if let Some(command) = defaults.get("validation.command") {
+                    validation.push(command);
+                }
+            }
+            if validation.is_empty() {
+                validation.push(Resolved::new(infer_validation_command(), "inferred"));
+            }
         }
 
         let commit = if parsed.commit {
@@ -648,6 +709,7 @@ impl EffectiveSettings {
 
         Self {
             validation,
+            skip_validation,
             write_mode,
             write_mode_source,
             commit,
@@ -672,10 +734,24 @@ impl EffectiveSettings {
             .collect::<Vec<_>>()
             .join(",\n");
         format!(
-            "{{\n  \"write_mode\": {{ \"value\": \"{}\", \"source\": \"{}\" }},\n  \"validation\": [\n{}\n  ],\n  \"commit\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"push\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"open_pr\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"post_comment\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"verbose\": {}\n}}\n",
+            r#"{{
+  "write_mode": {{ "value": "{}", "source": "{}" }},
+  "validation": [
+{}
+  ],
+  "skip_validation": {{ "value": {}, "source": "{}" }},
+  "commit": {{ "value": {}, "source": "{}" }},
+  "push": {{ "value": {}, "source": "{}" }},
+  "open_pr": {{ "value": {}, "source": "{}" }},
+  "post_comment": {{ "value": {}, "source": "{}" }},
+  "verbose": {}
+}}
+"#,
             self.write_mode.as_str(),
             escape_json(&self.write_mode_source),
             validation,
+            self.skip_validation.value,
+            escape_json(&self.skip_validation.source),
             self.commit.value,
             escape_json(&self.commit.source),
             self.push.value,
@@ -690,8 +766,15 @@ impl EffectiveSettings {
 
     fn render_human(&self) -> String {
         let mut output = String::from("Effective settings:\n\nValidation commands:\n");
-        for command in &self.validation {
-            output.push_str(&format!("  {}    from {}\n", command.value, command.source));
+        if self.skip_validation.value {
+            output.push_str(&format!(
+                "  skipped    from {}\n",
+                self.skip_validation.source
+            ));
+        } else {
+            for command in &self.validation {
+                output.push_str(&format!("  {}    from {}\n", command.value, command.source));
+            }
         }
         output.push_str("\nWrite policy:\n");
         output.push_str(&format!(
@@ -717,6 +800,99 @@ impl EffectiveSettings {
         ));
         output
     }
+}
+
+struct ValidationReport {
+    skipped: bool,
+    results: Vec<ValidationCommandResult>,
+}
+
+impl ValidationReport {
+    fn skipped() -> Self {
+        Self {
+            skipped: true,
+            results: Vec::new(),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.results.iter().any(|result| !result.success)
+    }
+
+    fn to_markdown(&self) -> String {
+        if self.skipped {
+            return "# Validation\n\nValidation was skipped by settings.\n".to_string();
+        }
+
+        let mut markdown = String::from("# Validation\n\n");
+        if self.results.is_empty() {
+            markdown.push_str("No validation commands were configured.\n");
+            return markdown;
+        }
+
+        for result in &self.results {
+            markdown.push_str(&format!(
+                "## `{}`\n\n- Source: {}\n- Exit code: {}\n- Status: {}\n\n",
+                result.command,
+                result.source,
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string()),
+                if result.success { "passed" } else { "failed" }
+            ));
+            markdown.push_str("### stdout\n\n```text\n");
+            markdown.push_str(&result.stdout);
+            if !result.stdout.ends_with('\n') {
+                markdown.push('\n');
+            }
+            markdown.push_str("```\n\n### stderr\n\n```text\n");
+            markdown.push_str(&result.stderr);
+            if !result.stderr.ends_with('\n') {
+                markdown.push('\n');
+            }
+            markdown.push_str("```\n\n");
+        }
+        markdown
+    }
+}
+
+struct ValidationCommandResult {
+    command: String,
+    source: String,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_validation(repo: &Path, settings: &EffectiveSettings) -> Result<ValidationReport, String> {
+    if settings.skip_validation.value {
+        return Ok(ValidationReport::skipped());
+    }
+
+    let mut results = Vec::new();
+    for command in &settings.validation {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command.value)
+            .current_dir(repo)
+            .output()
+            .map_err(|error| format!("cannot run validation `{}`: {error}", command.value))?;
+        results.push(ValidationCommandResult {
+            command: command.value.clone(),
+            source: command.source.clone(),
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        });
+    }
+
+    Ok(ValidationReport {
+        skipped: false,
+        results,
+    })
 }
 
 struct TargetContext {
@@ -1031,6 +1207,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 fn env_key_for_default(key: &str) -> Option<&'static str> {
     match key {
         "validation.command" => Some("VALKYRIE_VALIDATION_COMMAND"),
+        "validation.skip" => Some("VALKYRIE_SKIP_VALIDATION"),
         "write.commit" => Some("VALKYRIE_WRITE_COMMIT"),
         "write.push" => Some("VALKYRIE_WRITE_PUSH"),
         "write.open_pr" => Some("VALKYRIE_WRITE_OPEN_PR"),
@@ -1051,7 +1228,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--json] [--verbose]\n  valkyrie plan <task>|issue <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -1089,5 +1266,33 @@ mod tests {
         );
         assert_eq!(json_string_field(json, "state"), Some("OPEN".to_string()));
         assert_eq!(json_string_field(json, "missing"), None);
+    }
+
+    #[test]
+    fn validation_report_markdown_includes_command_output() {
+        let report = ValidationReport {
+            skipped: false,
+            results: vec![ValidationCommandResult {
+                command: "cargo test".to_string(),
+                source: "cli".to_string(),
+                success: true,
+                exit_code: Some(0),
+                stdout: "ok\n".to_string(),
+                stderr: String::new(),
+            }],
+        };
+
+        let markdown = report.to_markdown();
+        assert!(markdown.contains("## `cargo test`"));
+        assert!(markdown.contains("- Source: cli"));
+        assert!(markdown.contains("- Status: passed"));
+        assert!(markdown.contains("ok"));
+    }
+
+    #[test]
+    fn skipped_validation_report_is_not_failed() {
+        let report = ValidationReport::skipped();
+        assert!(!report.failed());
+        assert!(report.to_markdown().contains("Validation was skipped"));
     }
 }
