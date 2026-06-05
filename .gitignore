@@ -1,4 +1,5 @@
 /target
+/.valkyrie
 
 .brokk/
 # Mjolnir linked worktrees
