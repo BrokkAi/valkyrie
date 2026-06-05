@@ -26,6 +26,7 @@ fn run() -> Result<(), String> {
         "run" => command_run(args, false),
         "plan" => command_plan(args),
         "issue" => command_issue(args),
+        "pr" => command_pr(args),
         "defaults" => command_defaults(args),
         "status" => command_show_artifact(args, "result.json"),
         "logs" => command_show_artifact(args, "events.jsonl"),
@@ -64,7 +65,12 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     write_text(run_dir.join("effective-settings.json"), &settings.to_json())?;
     write_text(run_dir.join("context.md"), &target_context.to_markdown())?;
     if let Some(metadata_json) = &target_context.metadata_json {
-        write_text(run_dir.join("issue.json"), metadata_json)?;
+        let metadata_file = match &parsed.target {
+            Target::Issue(_) => "issue.json",
+            Target::PullRequest(_) => "pr.json",
+            Target::LocalTask(_) => "metadata.json",
+        };
+        write_text(run_dir.join(metadata_file), metadata_json)?;
     }
     write_text(run_dir.join("plan.md"), &plan)?;
     write_text(
@@ -194,6 +200,23 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
             plan_only = true;
         } else {
             rewritten.push(arg);
+        }
+    }
+    command_run(rewritten, plan_only)
+}
+
+fn command_pr(args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: valkyrie pr <number> [--repo <path>] [--fix] [--plan]".to_string());
+    }
+
+    let mut rewritten = vec!["pr".to_string(), args[0].clone()];
+    let mut plan_only = false;
+    for arg in args.into_iter().skip(1) {
+        match arg.as_str() {
+            "--plan" => plan_only = true,
+            "--fix" => {}
+            _ => rewritten.push(arg),
         }
     }
     command_run(rewritten, plan_only)
@@ -362,12 +385,15 @@ impl ParsedRun {
 enum Target {
     LocalTask(String),
     Issue(String),
+    PullRequest(String),
 }
 
 impl Target {
     fn from_parts(parts: Vec<String>) -> Self {
         if parts.len() >= 2 && parts[0] == "issue" {
             Self::Issue(parts[1].clone())
+        } else if parts.len() >= 2 && parts[0] == "pr" {
+            Self::PullRequest(parts[1].clone())
         } else {
             Self::LocalTask(parts.join(" "))
         }
@@ -377,6 +403,7 @@ impl Target {
         match self {
             Self::LocalTask(_) => "local-task",
             Self::Issue(_) => "github-issue",
+            Self::PullRequest(_) => "github-pr",
         }
     }
 
@@ -384,13 +411,14 @@ impl Target {
         match self {
             Self::LocalTask(task) => slugify(task),
             Self::Issue(number) => format!("issue-{number}"),
+            Self::PullRequest(number) => format!("pr-{number}"),
         }
     }
 }
 
 fn rewrite_target_alias(args: Vec<String>) -> Vec<String> {
-    if args.len() >= 2 && args[0] == "issue" {
-        let mut rewritten = vec!["issue".to_string(), args[1].clone()];
+    if args.len() >= 2 && (args[0] == "issue" || args[0] == "pr") {
+        let mut rewritten = vec![args[0].clone(), args[1].clone()];
         rewritten.extend(args.into_iter().skip(2));
         rewritten
     } else {
@@ -914,7 +942,7 @@ impl TargetContext {
             markdown.push('\n');
         }
         if self.metadata_json.is_some() {
-            markdown.push_str("\nRaw issue metadata was captured in `issue.json`.\n");
+            markdown.push_str("\nRaw target metadata was captured in the run directory.\n");
         }
         markdown
     }
@@ -929,6 +957,7 @@ fn resolve_target_context(target: &Target, repo: &Path) -> TargetContext {
             warning: None,
         },
         Target::Issue(number) => resolve_issue_context(number, repo),
+        Target::PullRequest(number) => resolve_pr_context(number, repo),
     }
 }
 
@@ -968,6 +997,42 @@ fn resolve_issue_context(number: &str, repo: &Path) -> TargetContext {
     }
 }
 
+fn resolve_pr_context(number: &str, repo: &Path) -> TargetContext {
+    match gh_pr_view(number, repo) {
+        Ok(json) => {
+            let title =
+                json_string_field(&json, "title").unwrap_or_else(|| format!("PR #{number}"));
+            let url = json_string_field(&json, "url");
+            let state = json_string_field(&json, "state");
+            let mut summary = format!("GitHub PR #{number}: {title}");
+            if let Some(state) = state {
+                summary.push_str(&format!("\n- State: {state}"));
+            }
+            if let Some(url) = url {
+                summary.push_str(&format!("\n- URL: {url}"));
+            }
+            summary.push_str("\n- Metadata source: `gh pr view`.");
+
+            TargetContext {
+                problem_statement: format!("Fix GitHub PR #{number}: {title}"),
+                summary,
+                metadata_json: Some(json),
+                warning: None,
+            }
+        }
+        Err(error) => TargetContext {
+            problem_statement: format!("Fix GitHub PR #{number}"),
+            summary: format!(
+                "GitHub PR #{number} was selected, but metadata could not be fetched."
+            ),
+            metadata_json: None,
+            warning: Some(format!(
+                "Install/authenticate the GitHub CLI (`gh`) or run in a GitHub-aware environment to fetch PR details. Fetch error: {error}"
+            )),
+        },
+    }
+}
+
 fn gh_issue_view(number: &str, repo: &Path) -> Result<String, String> {
     let output = Command::new("gh")
         .args([
@@ -977,6 +1042,23 @@ fn gh_issue_view(number: &str, repo: &Path) -> Result<String, String> {
             "--json",
             "title,body,labels,comments,url,state,author",
         ])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("cannot run gh: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+const GH_PR_VIEW_JSON_FIELDS: &str =
+    "title,body,comments,reviews,url,state,author,headRefName,baseRefName";
+
+fn gh_pr_view(number: &str, repo: &Path) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["pr", "view", number, "--json", GH_PR_VIEW_JSON_FIELDS])
         .current_dir(repo)
         .output()
         .map_err(|error| format!("cannot run gh: {error}"))?;
@@ -1048,6 +1130,12 @@ fn render_target_json(target: &Target, repo: &Path) -> String {
             escape_json(&repo.display().to_string())
         ),
         Target::Issue(number) => format!(
+            "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
+            target.kind(),
+            escape_json(number),
+            escape_json(&repo.display().to_string())
+        ),
+        Target::PullRequest(number) => format!(
             "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
             target.kind(),
             escape_json(number),
@@ -1228,7 +1316,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -1243,10 +1331,240 @@ mod tests {
     }
 
     #[test]
+    fn target_parses_local_task_when_no_known_alias_is_present() {
+        let target = Target::from_parts(vec!["fix".to_string(), "parser".to_string()]);
+        assert_eq!(target.kind(), "local-task");
+        assert_eq!(target.slug(), "fix-parser");
+    }
+
+    #[test]
+    fn rewrite_target_alias_leaves_local_tasks_unchanged() {
+        let args = vec![
+            "fix".to_string(),
+            "parser".to_string(),
+            "--repo".to_string(),
+            ".".to_string(),
+        ];
+
+        assert_eq!(rewrite_target_alias(args.clone()), args);
+    }
+
+    #[test]
     fn target_parses_issue_alias() {
         let target = Target::from_parts(vec!["issue".to_string(), "123".to_string()]);
         assert_eq!(target.kind(), "github-issue");
         assert_eq!(target.slug(), "issue-123");
+    }
+
+    #[test]
+    fn target_parses_pull_request_alias() {
+        let target = Target::from_parts(vec!["pr".to_string(), "456".to_string()]);
+        assert_eq!(target.kind(), "github-pr");
+        assert_eq!(target.slug(), "pr-456");
+    }
+
+    #[test]
+    fn rewrite_target_alias_preserves_pull_request_target() {
+        let rewritten = rewrite_target_alias(vec![
+            "pr".to_string(),
+            "456".to_string(),
+            "--repo".to_string(),
+            ".".to_string(),
+        ]);
+
+        assert_eq!(
+            rewritten,
+            vec![
+                "pr".to_string(),
+                "456".to_string(),
+                "--repo".to_string(),
+                ".".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_target_json_includes_pull_request_kind_and_number() {
+        let target = Target::PullRequest("456".to_string());
+        let json = render_target_json(&target, Path::new("/tmp/example"));
+
+        assert!(json.contains("\"kind\": \"github-pr\""));
+        assert!(json.contains("\"number\": \"456\""));
+        assert!(json.contains("\"repo\": \"/tmp/example\""));
+    }
+
+    #[test]
+    fn parsed_run_parse_captures_flags_and_pull_request_target() {
+        let parsed = ParsedRun::parse(
+            vec![
+                "pr".to_string(),
+                "456".to_string(),
+                "--repo".to_string(),
+                ".".to_string(),
+                "--validate".to_string(),
+                "cargo test".to_string(),
+                "--dry-run".to_string(),
+                "--commit".to_string(),
+                "--push".to_string(),
+                "--open-pr".to_string(),
+                "--post-comment".to_string(),
+                "--json".to_string(),
+                "--verbose".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert!(matches!(parsed.target, Target::PullRequest(ref number) if number == "456"));
+        assert_eq!(parsed.repo, PathBuf::from("."));
+        assert_eq!(parsed.validations, vec!["cargo test".to_string()]);
+        assert!(parsed.dry_run);
+        assert!(parsed.commit);
+        assert!(parsed.push);
+        assert!(parsed.open_pr);
+        assert!(parsed.post_comment);
+        assert!(parsed.json);
+        assert!(parsed.verbose);
+    }
+
+    #[test]
+    fn parsed_run_parse_rejects_missing_task_unknown_flag_and_missing_flag_value() {
+        assert!(ParsedRun::parse(Vec::new(), false).is_err());
+        assert!(
+            ParsedRun::parse(vec!["task".to_string(), "--unknown".to_string()], false).is_err()
+        );
+        assert!(ParsedRun::parse(vec!["task".to_string(), "--repo".to_string()], false).is_err());
+    }
+
+    #[test]
+    fn defaults_args_parse_set_global_and_errors() {
+        let parsed = DefaultsArgs::parse(vec![
+            "--global".to_string(),
+            "set".to_string(),
+            "validation.command".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ])
+        .unwrap();
+
+        assert!(matches!(parsed.scope, DefaultsScope::User));
+        match parsed.action {
+            DefaultsAction::Set(key, value) => {
+                assert_eq!(key, "validation.command");
+                assert_eq!(value, "cargo test");
+            }
+            _ => panic!("expected set action"),
+        }
+
+        assert!(DefaultsArgs::parse(Vec::new()).is_err());
+        assert!(DefaultsArgs::parse(vec!["set".to_string(), "only-key".to_string()]).is_err());
+        assert!(DefaultsArgs::parse(vec!["unset".to_string()]).is_err());
+        assert!(DefaultsArgs::parse(vec!["unknown".to_string()]).is_err());
+    }
+
+    #[test]
+    fn defaults_store_loads_env_file_and_exports_yaml() {
+        let path = env::temp_dir().join(format!("valkyrie-defaults-{}.env", make_run_id("test")));
+        fs::write(
+            &path,
+            "# comment\n\nvalidation.command = cargo test\nwrite.commit=true\nignored-without-equals\n",
+        )
+        .unwrap();
+
+        let store = DefaultsStore::load(&path).unwrap();
+        assert_eq!(
+            store.values.get("validation.command"),
+            Some(&"cargo test".to_string())
+        );
+        assert_eq!(store.values.get("write.commit"), Some(&"true".to_string()));
+        assert!(!store.values.contains_key("ignored-without-equals"));
+
+        let yaml = store.to_yaml(DefaultsScope::Repo);
+        assert!(yaml.contains("# Generated by `valkyrie defaults export --repo`."));
+        assert!(yaml.contains("validation:\n  command: cargo test"));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn effective_settings_selects_write_modes_from_cli_flags() {
+        let defaults = DefaultsResolver {
+            repo: DefaultsStore::default(),
+            user: DefaultsStore::default(),
+        };
+
+        let mut parsed =
+            ParsedRun::parse(vec!["task".to_string(), "--no-write".to_string()], false).unwrap();
+        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
+        assert_eq!(settings.write_mode, WriteMode::NoWrite);
+        assert_eq!(settings.write_mode_source, "cli");
+
+        parsed = ParsedRun::parse(vec!["task".to_string(), "--commit".to_string()], false).unwrap();
+        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
+        assert_eq!(settings.write_mode, WriteMode::Commit);
+
+        parsed = ParsedRun::parse(vec!["task".to_string(), "--push".to_string()], false).unwrap();
+        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
+        assert_eq!(settings.write_mode, WriteMode::Push);
+
+        parsed =
+            ParsedRun::parse(vec!["task".to_string(), "--open-pr".to_string()], false).unwrap();
+        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
+        assert_eq!(settings.write_mode, WriteMode::Pr);
+    }
+
+    #[test]
+    fn target_context_markdown_includes_warning_and_generic_metadata_note() {
+        let context = TargetContext {
+            problem_statement: "Fix PR #456".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: Some("{}".to_string()),
+            warning: Some("gh is unavailable".to_string()),
+        };
+
+        let markdown = context.to_markdown();
+        assert!(markdown.contains("Fix PR #456"));
+        assert!(markdown.contains("gh is unavailable"));
+        assert!(markdown.contains("Raw target metadata was captured"));
+        assert!(!markdown.contains("issue.json"));
+    }
+
+    #[test]
+    fn gh_pr_view_fields_do_not_include_unsupported_review_threads() {
+        assert!(GH_PR_VIEW_JSON_FIELDS.contains("reviews"));
+        assert!(GH_PR_VIEW_JSON_FIELDS.contains("comments"));
+        assert!(!GH_PR_VIEW_JSON_FIELDS.contains("reviewThreads"));
+    }
+
+    #[test]
+    fn validation_report_markdown_covers_failed_command_without_newlines() {
+        let report = ValidationReport {
+            skipped: false,
+            results: vec![ValidationCommandResult {
+                command: "false".to_string(),
+                source: "cli".to_string(),
+                success: false,
+                exit_code: None,
+                stdout: "no-newline".to_string(),
+                stderr: "err".to_string(),
+            }],
+        };
+
+        assert!(report.failed());
+        let markdown = report.to_markdown();
+        assert!(markdown.contains("- Exit code: terminated by signal"));
+        assert!(markdown.contains("- Status: failed"));
+        assert!(markdown.contains("no-newline\n```"));
+        assert!(markdown.contains("err\n```"));
+    }
+
+    #[test]
+    fn render_created_json_uses_planned_or_created_state() {
+        let planned = render_created_json("run-1", Path::new("/tmp/run-1"), true);
+        let created = render_created_json("run-2", Path::new("/tmp/run-2"), false);
+
+        assert!(planned.contains("\"state\": \"planned\""));
+        assert!(created.contains("\"state\": \"created\""));
     }
 
     #[test]
