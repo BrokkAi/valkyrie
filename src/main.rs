@@ -25,6 +25,7 @@ fn run() -> Result<(), String> {
     match command.as_str() {
         "run" => command_run(args, false),
         "plan" => command_plan(args),
+        "issue" => command_issue(args),
         "defaults" => command_defaults(args),
         "status" => command_show_artifact(args, "result.json"),
         "logs" => command_show_artifact(args, "events.jsonl"),
@@ -42,23 +43,10 @@ fn run() -> Result<(), String> {
 
 fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     let parsed = ParsedRun::parse(args, plan_only)?;
-    let repo = parsed.repo.canonicalize().map_err(|error| {
-        format!(
-            "cannot resolve repo path `{}`: {error}",
-            parsed.repo.display()
-        )
-    })?;
-
-    if !repo.join(".git").exists() {
-        return Err(format!(
-            "`{}` does not look like a git repository",
-            repo.display()
-        ));
-    }
-
-    let defaults = Defaults::load(&repo)?;
+    let repo = resolve_repo(&parsed.repo)?;
+    let defaults = DefaultsResolver::load(&repo)?;
     let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-    let run_id = make_run_id(&parsed.target_slug());
+    let run_id = make_run_id(&parsed.target.slug());
     let run_dir = repo.join(".valkyrie").join("runs").join(&run_id);
     fs::create_dir_all(&run_dir).map_err(|error| {
         format!(
@@ -70,7 +58,7 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     let plan = render_plan(&parsed, &settings, plan_only);
     write_text(
         run_dir.join("target.json"),
-        &render_target_json(&parsed, &repo),
+        &render_target_json(&parsed.target, &repo),
     )?;
     write_text(run_dir.join("effective-settings.json"), &settings.to_json())?;
     write_text(run_dir.join("plan.md"), &plan)?;
@@ -79,7 +67,11 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
         &format!(
             "{{\"event\":\"run_created\",\"run_id\":\"{}\",\"mode\":\"{}\"}}\n",
             escape_json(&run_id),
-            if plan_only { "plan" } else { "local-patch" }
+            if plan_only {
+                "plan"
+            } else {
+                settings.write_mode.as_str()
+            }
         ),
     )?;
 
@@ -90,9 +82,13 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
         println!("Artifacts: {}", run_dir.display());
         println!();
         println!("{plan}");
+        if parsed.verbose || parsed.dry_run || plan_only {
+            println!();
+            println!("{}", settings.render_human());
+        }
     }
 
-    if plan_only || parsed.no_write || parsed.dry_run {
+    if plan_only || settings.write_mode == WriteMode::NoWrite {
         write_text(run_dir.join("diff.patch"), "")?;
         write_text(
             run_dir.join("summary.md"),
@@ -132,64 +128,63 @@ fn command_plan(args: Vec<String>) -> Result<(), String> {
         return Err("usage: valkyrie plan <task>|issue <number> [--repo <path>]".to_string());
     }
 
-    let task = if args[0] == "issue" && args.len() > 1 {
-        let mut rewritten = vec![format!("issue {}", args[1])];
-        rewritten.extend(args.into_iter().skip(2));
-        rewritten
-    } else {
-        args
-    };
-
-    command_run(task, true)
+    command_run(rewrite_target_alias(args), true)
 }
 
-fn command_defaults(mut args: Vec<String>) -> Result<(), String> {
+fn command_issue(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: valkyrie defaults <get|set|unset|export> [key] [value]".to_string());
+        return Err("usage: valkyrie issue <number> [--repo <path>] [--plan]".to_string());
     }
 
-    let action = args.remove(0);
-    let repo = current_repo()?;
-    let mut defaults = Defaults::load(&repo)?;
+    let mut rewritten = vec!["issue".to_string(), args[0].clone()];
+    let mut plan_only = false;
+    for arg in args.into_iter().skip(1) {
+        if arg == "--plan" {
+            plan_only = true;
+        } else {
+            rewritten.push(arg);
+        }
+    }
+    command_run(rewritten, plan_only)
+}
 
-    match action.as_str() {
-        "get" => {
-            if let Some(key) = args.first() {
-                match defaults.values.get(key) {
+fn command_defaults(args: Vec<String>) -> Result<(), String> {
+    let defaults_args = DefaultsArgs::parse(args)?;
+    let repo = resolve_repo(&defaults_args.repo)?;
+    let scope = defaults_args.scope;
+    let action = defaults_args.action;
+    let path = defaults_path(&repo, scope)?;
+    let mut store = DefaultsStore::load(&path)?;
+
+    match action {
+        DefaultsAction::Get(key) => {
+            if let Some(key) = key {
+                match store.values.get(&key) {
                     Some(value) => println!("{value}"),
-                    None => return Err(format!("default `{key}` is not set")),
+                    None => return Err(format!("default `{key}` is not set in {scope}")),
                 }
-            } else if defaults.values.is_empty() {
-                println!("No repo defaults set.");
+            } else if store.values.is_empty() {
+                println!("No {scope} defaults set.");
             } else {
-                for (key, value) in &defaults.values {
+                for (key, value) in &store.values {
                     println!("{key}={value}");
                 }
             }
         }
-        "set" => {
-            if args.len() < 2 {
-                return Err("usage: valkyrie defaults set <key> <value>".to_string());
-            }
-            let key = args.remove(0);
-            let value = args.join(" ");
-            defaults.values.insert(key.clone(), value.clone());
-            defaults.save(&repo)?;
-            println!("Set repo default {key}={value}");
+        DefaultsAction::Set(key, value) => {
+            store.values.insert(key.clone(), value.clone());
+            store.save(&path)?;
+            println!("Set {scope} default {key}={value}");
         }
-        "unset" => {
-            let Some(key) = args.first() else {
-                return Err("usage: valkyrie defaults unset <key>".to_string());
-            };
-            defaults.values.remove(key);
-            defaults.save(&repo)?;
-            println!("Unset repo default {key}");
+        DefaultsAction::Unset(key) => {
+            store.values.remove(&key);
+            store.save(&path)?;
+            println!("Unset {scope} default {key}");
         }
-        "export" => {
-            print!("{}", defaults.to_yaml());
+        DefaultsAction::Export => {
+            print!("{}", store.to_yaml(scope));
             io::stdout().flush().map_err(|error| error.to_string())?;
         }
-        other => return Err(format!("unknown defaults action `{other}`")),
     }
 
     Ok(())
@@ -221,12 +216,25 @@ fn command_doctor() -> Result<(), String> {
         }
     );
     println!("repo: {}", current_repo()?.display());
+    println!(
+        "repo defaults: {}",
+        current_repo()?.join(".valkyrie/defaults.env").display()
+    );
+    println!("user defaults: {}", user_defaults_path()?.display());
+    println!(
+        "anvil: {}",
+        if command_exists("anvil") {
+            "ok"
+        } else {
+            "missing"
+        }
+    );
     Ok(())
 }
 
 #[derive(Debug)]
 struct ParsedRun {
-    task: String,
+    target: Target,
     repo: PathBuf,
     dry_run: bool,
     no_write: bool,
@@ -279,7 +287,7 @@ impl ParsedRun {
         }
 
         Ok(Self {
-            task: task_parts.join(" "),
+            target: Target::from_parts(task_parts),
             repo,
             dry_run,
             no_write,
@@ -293,38 +301,152 @@ impl ParsedRun {
             validations,
         })
     }
+}
 
-    fn target_slug(&self) -> String {
-        self.task
-            .chars()
-            .map(|char| {
-                if char.is_ascii_alphanumeric() {
-                    char.to_ascii_lowercase()
-                } else {
-                    '-'
+#[derive(Debug)]
+enum Target {
+    LocalTask(String),
+    Issue(String),
+}
+
+impl Target {
+    fn from_parts(parts: Vec<String>) -> Self {
+        if parts.len() >= 2 && parts[0] == "issue" {
+            Self::Issue(parts[1].clone())
+        } else {
+            Self::LocalTask(parts.join(" "))
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::LocalTask(_) => "local-task",
+            Self::Issue(_) => "github-issue",
+        }
+    }
+
+    fn problem_statement(&self) -> String {
+        match self {
+            Self::LocalTask(task) => task.clone(),
+            Self::Issue(number) => format!("Fix GitHub issue #{number}"),
+        }
+    }
+
+    fn slug(&self) -> String {
+        match self {
+            Self::LocalTask(task) => slugify(task),
+            Self::Issue(number) => format!("issue-{number}"),
+        }
+    }
+}
+
+fn rewrite_target_alias(args: Vec<String>) -> Vec<String> {
+    if args.len() >= 2 && args[0] == "issue" {
+        let mut rewritten = vec!["issue".to_string(), args[1].clone()];
+        rewritten.extend(args.into_iter().skip(2));
+        rewritten
+    } else {
+        args
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DefaultsScope {
+    Repo,
+    User,
+}
+
+impl std::fmt::Display for DefaultsScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repo => write!(formatter, "repo"),
+            Self::User => write!(formatter, "user"),
+        }
+    }
+}
+
+enum DefaultsAction {
+    Get(Option<String>),
+    Set(String, String),
+    Unset(String),
+    Export,
+}
+
+struct DefaultsArgs {
+    scope: DefaultsScope,
+    repo: PathBuf,
+    action: DefaultsAction,
+}
+
+impl DefaultsArgs {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        if args.is_empty() {
+            return Err(
+                "usage: valkyrie defaults [--repo <path>] [--global] <get|set|unset|export>"
+                    .to_string(),
+            );
+        }
+
+        let mut scope = DefaultsScope::Repo;
+        let mut repo = PathBuf::from(".");
+        let mut positional = Vec::new();
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--global" | "--user" => scope = DefaultsScope::User,
+                "--repo" => repo = PathBuf::from(next_value(&mut iter, "--repo")?),
+                flag if flag.starts_with('-') => {
+                    return Err(format!("unknown defaults flag `{flag}`"));
                 }
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .chars()
-            .take(40)
-            .collect()
+                value => positional.push(value.to_string()),
+            }
+        }
+
+        if positional.is_empty() {
+            return Err(
+                "usage: valkyrie defaults <get|set|unset|export> [key] [value]".to_string(),
+            );
+        }
+
+        let action = match positional.remove(0).as_str() {
+            "get" => DefaultsAction::Get(positional.first().cloned()),
+            "set" => {
+                if positional.len() < 2 {
+                    return Err("usage: valkyrie defaults set <key> <value>".to_string());
+                }
+                let key = positional.remove(0);
+                DefaultsAction::Set(key, positional.join(" "))
+            }
+            "unset" => {
+                let Some(key) = positional.first() else {
+                    return Err("usage: valkyrie defaults unset <key>".to_string());
+                };
+                DefaultsAction::Unset(key.clone())
+            }
+            "export" => DefaultsAction::Export,
+            other => return Err(format!("unknown defaults action `{other}`")),
+        };
+
+        Ok(Self {
+            scope,
+            repo,
+            action,
+        })
     }
 }
 
 #[derive(Default)]
-struct Defaults {
+struct DefaultsStore {
     values: BTreeMap<String, String>,
 }
 
-impl Defaults {
-    fn load(repo: &Path) -> Result<Self, String> {
-        let path = repo.join(".valkyrie").join("defaults.env");
+impl DefaultsStore {
+    fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(path)
             .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
         let mut values = BTreeMap::new();
         for line in content.lines() {
@@ -339,10 +461,11 @@ impl Defaults {
         Ok(Self { values })
     }
 
-    fn save(&self, repo: &Path) -> Result<(), String> {
-        let dir = repo.join(".valkyrie");
-        fs::create_dir_all(&dir)
-            .map_err(|error| format!("cannot create `{}`: {error}", dir.display()))?;
+    fn save(&self, path: &Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|error| format!("cannot create `{}`: {error}", dir.display()))?;
+        }
         let mut content = String::from(
             "# Generated by `valkyrie defaults set`. Prefer CLI commands over hand editing.\n",
         );
@@ -352,12 +475,16 @@ impl Defaults {
             content.push_str(value);
             content.push('\n');
         }
-        write_text(dir.join("defaults.env"), &content)
+        write_text(path.to_path_buf(), &content)
     }
 
-    fn to_yaml(&self) -> String {
-        let mut yaml = String::from(
-            "# Generated by `valkyrie defaults export`.\n# Prefer `valkyrie defaults set <key> <value>` over hand-editing.\n",
+    fn to_yaml(&self, scope: DefaultsScope) -> String {
+        let mut yaml = format!(
+            "# Generated by `valkyrie defaults export --{}`.\n# Prefer `valkyrie defaults set <key> <value>` over hand-editing.\n",
+            match scope {
+                DefaultsScope::Repo => "repo",
+                DefaultsScope::User => "global",
+            }
         );
         for (key, value) in &self.values {
             yaml.push_str(&format!("{}: {}\n", key.replace('.', ":\n  "), value));
@@ -366,62 +493,169 @@ impl Defaults {
     }
 }
 
+struct DefaultsResolver {
+    repo: DefaultsStore,
+    user: DefaultsStore,
+}
+
+impl DefaultsResolver {
+    fn load(repo: &Path) -> Result<Self, String> {
+        Ok(Self {
+            repo: DefaultsStore::load(&defaults_path(repo, DefaultsScope::Repo)?)?,
+            user: DefaultsStore::load(&defaults_path(repo, DefaultsScope::User)?)?,
+        })
+    }
+
+    fn get(&self, key: &str) -> Option<Resolved<String>> {
+        env_key_for_default(key)
+            .and_then(|env_key| {
+                env::var(env_key)
+                    .ok()
+                    .map(|value| Resolved::new(value, "env"))
+            })
+            .or_else(|| {
+                self.repo
+                    .values
+                    .get(key)
+                    .cloned()
+                    .map(|value| Resolved::new(value, "repo default"))
+            })
+            .or_else(|| {
+                self.user
+                    .values
+                    .get(key)
+                    .cloned()
+                    .map(|value| Resolved::new(value, "user default"))
+            })
+    }
+
+    fn bool(&self, key: &str) -> Option<Resolved<bool>> {
+        self.get(key).and_then(|resolved| {
+            parse_bool(&resolved.value).map(|value| resolved.with_value(value))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct Resolved<T> {
+    value: T,
+    source: String,
+}
+
+impl<T> Resolved<T> {
+    fn new(value: T, source: impl Into<String>) -> Self {
+        Self {
+            value,
+            source: source.into(),
+        }
+    }
+
+    fn with_value<U>(self, value: U) -> Resolved<U> {
+        Resolved {
+            value,
+            source: self.source,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteMode {
+    NoWrite,
+    LocalPatch,
+    Commit,
+    Push,
+    Pr,
+}
+
+impl WriteMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoWrite => "no-write",
+            Self::LocalPatch => "local-patch",
+            Self::Commit => "commit",
+            Self::Push => "push",
+            Self::Pr => "pr",
+        }
+    }
+}
+
 struct EffectiveSettings {
-    validation: Vec<(String, &'static str)>,
-    write_mode: &'static str,
-    commit: (bool, &'static str),
-    push: (bool, &'static str),
-    open_pr: (bool, &'static str),
-    post_comment: (bool, &'static str),
+    validation: Vec<Resolved<String>>,
+    write_mode: WriteMode,
+    write_mode_source: String,
+    commit: Resolved<bool>,
+    push: Resolved<bool>,
+    open_pr: Resolved<bool>,
+    post_comment: Resolved<bool>,
     verbose: bool,
 }
 
 impl EffectiveSettings {
-    fn from_inputs(parsed: &ParsedRun, defaults: &Defaults) -> Self {
+    fn from_inputs(parsed: &ParsedRun, defaults: &DefaultsResolver) -> Self {
         let mut validation = Vec::new();
         for command in &parsed.validations {
-            validation.push((command.clone(), "cli"));
+            validation.push(Resolved::new(command.clone(), "cli"));
         }
         if validation.is_empty() {
-            if let Some(command) = defaults.values.get("validation.command") {
-                validation.push((command.clone(), "repo default"));
+            if let Some(command) = defaults.get("validation.command") {
+                validation.push(command);
             }
         }
         if validation.is_empty() {
-            validation.push(("cargo test".to_string(), "inferred"));
+            validation.push(Resolved::new(infer_validation_command(), "inferred"));
         }
 
-        let write_mode = if parsed.no_write || parsed.dry_run {
-            "no-write"
-        } else if parsed.open_pr {
-            "pr"
-        } else if parsed.push {
-            "push"
-        } else if parsed.commit {
-            "commit"
-        } else if parsed.write {
-            "local-patch"
+        let commit = if parsed.commit {
+            Resolved::new(true, "cli")
         } else {
-            "local-patch"
+            defaults
+                .bool("write.commit")
+                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
+        };
+        let push = if parsed.push {
+            Resolved::new(true, "cli")
+        } else {
+            defaults
+                .bool("write.push")
+                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
+        };
+        let open_pr = if parsed.open_pr {
+            Resolved::new(true, "cli")
+        } else {
+            defaults
+                .bool("write.open_pr")
+                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
+        };
+        let post_comment = if parsed.post_comment {
+            Resolved::new(true, "cli")
+        } else {
+            defaults
+                .bool("write.post_comment")
+                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
+        };
+
+        let (write_mode, write_mode_source) = if parsed.no_write || parsed.dry_run {
+            (WriteMode::NoWrite, "cli".to_string())
+        } else if open_pr.value {
+            (WriteMode::Pr, open_pr.source.clone())
+        } else if push.value {
+            (WriteMode::Push, push.source.clone())
+        } else if commit.value {
+            (WriteMode::Commit, commit.source.clone())
+        } else if parsed.write {
+            (WriteMode::LocalPatch, "cli".to_string())
+        } else {
+            (WriteMode::LocalPatch, "built-in default".to_string())
         };
 
         Self {
             validation,
             write_mode,
-            commit: (parsed.commit, if parsed.commit { "cli" } else { "default" }),
-            push: (parsed.push, if parsed.push { "cli" } else { "default" }),
-            open_pr: (
-                parsed.open_pr,
-                if parsed.open_pr { "cli" } else { "default" },
-            ),
-            post_comment: (
-                parsed.post_comment,
-                if parsed.post_comment {
-                    "cli"
-                } else {
-                    "default"
-                },
-            ),
+            write_mode_source,
+            commit,
+            push,
+            open_pr,
+            post_comment,
             verbose: parsed.verbose,
         }
     }
@@ -430,29 +664,60 @@ impl EffectiveSettings {
         let validation = self
             .validation
             .iter()
-            .map(|(command, source)| {
+            .map(|resolved| {
                 format!(
                     "    {{ \"command\": \"{}\", \"source\": \"{}\" }}",
-                    escape_json(command),
-                    source
+                    escape_json(&resolved.value),
+                    escape_json(&resolved.source)
                 )
             })
             .collect::<Vec<_>>()
             .join(",\n");
         format!(
-            "{{\n  \"write_mode\": \"{}\",\n  \"validation\": [\n{}\n  ],\n  \"commit\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"push\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"open_pr\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"post_comment\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"verbose\": {}\n}}\n",
-            self.write_mode,
+            "{{\n  \"write_mode\": {{ \"value\": \"{}\", \"source\": \"{}\" }},\n  \"validation\": [\n{}\n  ],\n  \"commit\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"push\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"open_pr\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"post_comment\": {{ \"value\": {}, \"source\": \"{}\" }},\n  \"verbose\": {}\n}}\n",
+            self.write_mode.as_str(),
+            escape_json(&self.write_mode_source),
             validation,
-            self.commit.0,
-            self.commit.1,
-            self.push.0,
-            self.push.1,
-            self.open_pr.0,
-            self.open_pr.1,
-            self.post_comment.0,
-            self.post_comment.1,
+            self.commit.value,
+            escape_json(&self.commit.source),
+            self.push.value,
+            escape_json(&self.push.source),
+            self.open_pr.value,
+            escape_json(&self.open_pr.source),
+            self.post_comment.value,
+            escape_json(&self.post_comment.source),
             self.verbose,
         )
+    }
+
+    fn render_human(&self) -> String {
+        let mut output = String::from("Effective settings:\n\nValidation commands:\n");
+        for command in &self.validation {
+            output.push_str(&format!("  {}    from {}\n", command.value, command.source));
+        }
+        output.push_str("\nWrite policy:\n");
+        output.push_str(&format!(
+            "  mode: {}    from {}\n",
+            self.write_mode.as_str(),
+            self.write_mode_source
+        ));
+        output.push_str(&format!(
+            "  commit: {}    from {}\n",
+            self.commit.value, self.commit.source
+        ));
+        output.push_str(&format!(
+            "  push: {}    from {}\n",
+            self.push.value, self.push.source
+        ));
+        output.push_str(&format!(
+            "  open_pr: {}    from {}\n",
+            self.open_pr.value, self.open_pr.source
+        ));
+        output.push_str(&format!(
+            "  post_comment: {}    from {}",
+            self.post_comment.value, self.post_comment.source
+        ));
+        output
     }
 }
 
@@ -460,25 +725,35 @@ fn render_plan(parsed: &ParsedRun, settings: &EffectiveSettings, plan_only: bool
     let validation = settings
         .validation
         .iter()
-        .map(|(command, source)| format!("- `{command}` ({source})"))
+        .map(|resolved| format!("- `{}` ({})", resolved.value, resolved.source))
         .collect::<Vec<_>>()
         .join("\n");
 
     format!(
-        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}`{}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
-        parsed.task,
+        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
+        parsed.target.problem_statement(),
         validation,
-        settings.write_mode,
+        settings.write_mode.as_str(),
+        settings.write_mode_source,
         if plan_only { " (planning only)" } else { "" }
     )
 }
 
-fn render_target_json(parsed: &ParsedRun, repo: &Path) -> String {
-    format!(
-        "{{\n  \"kind\": \"local-task\",\n  \"task\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
-        escape_json(&parsed.task),
-        escape_json(&repo.display().to_string())
-    )
+fn render_target_json(target: &Target, repo: &Path) -> String {
+    match target {
+        Target::LocalTask(task) => format!(
+            "{{\n  \"kind\": \"{}\",\n  \"task\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
+            target.kind(),
+            escape_json(task),
+            escape_json(&repo.display().to_string())
+        ),
+        Target::Issue(number) => format!(
+            "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
+            target.kind(),
+            escape_json(number),
+            escape_json(&repo.display().to_string())
+        ),
+    }
 }
 
 fn render_created_json(run_id: &str, run_dir: &Path, plan_only: bool) -> String {
@@ -507,8 +782,58 @@ fn make_run_id(slug: &str) -> String {
     }
 }
 
+fn slugify(input: &str) -> String {
+    input
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() {
+                char.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(40)
+        .collect()
+}
+
 fn current_repo() -> Result<PathBuf, String> {
     env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))
+}
+
+fn resolve_repo(path: &Path) -> Result<PathBuf, String> {
+    let repo = path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve repo path `{}`: {error}", path.display()))?;
+
+    if !repo.join(".git").exists() {
+        return Err(format!(
+            "`{}` does not look like a git repository",
+            repo.display()
+        ));
+    }
+
+    Ok(repo)
+}
+
+fn defaults_path(repo: &Path, scope: DefaultsScope) -> Result<PathBuf, String> {
+    match scope {
+        DefaultsScope::Repo => Ok(repo.join(".valkyrie").join("defaults.env")),
+        DefaultsScope::User => Ok(user_defaults_path()?),
+    }
+}
+
+fn user_defaults_path() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var("VALKYRIE_DEFAULTS_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = env::var("HOME").map_err(|_| {
+        "cannot resolve user defaults path: HOME is not set and VALKYRIE_DEFAULTS_PATH was not provided"
+            .to_string()
+    })?;
+    Ok(PathBuf::from(home).join(".config/valkyrie/defaults.env"))
 }
 
 fn resolve_run_dir(repo: &Path, run_id: &str) -> Result<PathBuf, String> {
@@ -571,8 +896,62 @@ fn escape_json(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_key_for_default(key: &str) -> Option<&'static str> {
+    match key {
+        "validation.command" => Some("VALKYRIE_VALIDATION_COMMAND"),
+        "write.commit" => Some("VALKYRIE_WRITE_COMMIT"),
+        "write.push" => Some("VALKYRIE_WRITE_PUSH"),
+        "write.open_pr" => Some("VALKYRIE_WRITE_OPEN_PR"),
+        "write.post_comment" => Some("VALKYRIE_WRITE_POST_COMMENT"),
+        _ => None,
+    }
+}
+
+fn infer_validation_command() -> String {
+    if Path::new("Cargo.toml").exists() {
+        "cargo test".to_string()
+    } else if Path::new("package.json").exists() {
+        "npm test".to_string()
+    } else {
+        "echo 'no validation command inferred'".to_string()
+    }
+}
+
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--json]\n  valkyrie plan <task> [--repo <path>]\n  valkyrie defaults get [key]\n  valkyrie defaults set <key> <value>\n  valkyrie defaults unset <key>\n  valkyrie defaults export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nThis first milestone records run artifacts under .valkyrie/runs and keeps remote writes disabled by default."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--json] [--verbose]\n  valkyrie plan <task>|issue <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_limits_and_normalizes() {
+        assert_eq!(slugify("Fix the Parser Panic!"), "fix-the-parser-panic");
+        assert_eq!(slugify("---"), "");
+    }
+
+    #[test]
+    fn target_parses_issue_alias() {
+        let target = Target::from_parts(vec!["issue".to_string(), "123".to_string()]);
+        assert_eq!(target.kind(), "github-issue");
+        assert_eq!(target.slug(), "issue-123");
+    }
+
+    #[test]
+    fn bool_parser_accepts_common_values() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("off"), Some(false));
+        assert_eq!(parse_bool("maybe"), None);
+    }
 }
