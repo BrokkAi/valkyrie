@@ -46,6 +46,7 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     let repo = resolve_repo(&parsed.repo)?;
     let defaults = DefaultsResolver::load(&repo)?;
     let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
+    let target_context = resolve_target_context(&parsed.target, &repo);
     let run_id = make_run_id(&parsed.target.slug());
     let run_dir = repo.join(".valkyrie").join("runs").join(&run_id);
     fs::create_dir_all(&run_dir).map_err(|error| {
@@ -55,12 +56,16 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
         )
     })?;
 
-    let plan = render_plan(&parsed, &settings, plan_only);
+    let plan = render_plan(&parsed, &settings, &target_context, plan_only);
     write_text(
         run_dir.join("target.json"),
         &render_target_json(&parsed.target, &repo),
     )?;
     write_text(run_dir.join("effective-settings.json"), &settings.to_json())?;
+    write_text(run_dir.join("context.md"), &target_context.to_markdown())?;
+    if let Some(metadata_json) = &target_context.metadata_json {
+        write_text(run_dir.join("issue.json"), metadata_json)?;
+    }
     write_text(run_dir.join("plan.md"), &plan)?;
     write_text(
         run_dir.join("events.jsonl"),
@@ -322,13 +327,6 @@ impl Target {
         match self {
             Self::LocalTask(_) => "local-task",
             Self::Issue(_) => "github-issue",
-        }
-    }
-
-    fn problem_statement(&self) -> String {
-        match self {
-            Self::LocalTask(task) => task.clone(),
-            Self::Issue(number) => format!("Fix GitHub issue #{number}"),
         }
     }
 
@@ -721,7 +719,132 @@ impl EffectiveSettings {
     }
 }
 
-fn render_plan(parsed: &ParsedRun, settings: &EffectiveSettings, plan_only: bool) -> String {
+struct TargetContext {
+    problem_statement: String,
+    summary: String,
+    metadata_json: Option<String>,
+    warning: Option<String>,
+}
+
+impl TargetContext {
+    fn to_markdown(&self) -> String {
+        let mut markdown = format!(
+            "# Target Context\n\n## Problem statement\n\n{}\n\n## Summary\n\n{}\n",
+            self.problem_statement, self.summary
+        );
+        if let Some(warning) = &self.warning {
+            markdown.push_str("\n## Warning\n\n");
+            markdown.push_str(warning);
+            markdown.push('\n');
+        }
+        if self.metadata_json.is_some() {
+            markdown.push_str("\nRaw issue metadata was captured in `issue.json`.\n");
+        }
+        markdown
+    }
+}
+
+fn resolve_target_context(target: &Target, repo: &Path) -> TargetContext {
+    match target {
+        Target::LocalTask(task) => TargetContext {
+            problem_statement: task.clone(),
+            summary: "Local repository task provided directly on the CLI.".to_string(),
+            metadata_json: None,
+            warning: None,
+        },
+        Target::Issue(number) => resolve_issue_context(number, repo),
+    }
+}
+
+fn resolve_issue_context(number: &str, repo: &Path) -> TargetContext {
+    match gh_issue_view(number, repo) {
+        Ok(json) => {
+            let title =
+                json_string_field(&json, "title").unwrap_or_else(|| format!("Issue #{number}"));
+            let url = json_string_field(&json, "url");
+            let state = json_string_field(&json, "state");
+            let mut summary = format!("GitHub issue #{number}: {title}");
+            if let Some(state) = state {
+                summary.push_str(&format!("\n- State: {state}"));
+            }
+            if let Some(url) = url {
+                summary.push_str(&format!("\n- URL: {url}"));
+            }
+            summary.push_str("\n- Metadata source: `gh issue view`.");
+
+            TargetContext {
+                problem_statement: format!("Fix GitHub issue #{number}: {title}"),
+                summary,
+                metadata_json: Some(json),
+                warning: None,
+            }
+        }
+        Err(error) => TargetContext {
+            problem_statement: format!("Fix GitHub issue #{number}"),
+            summary: format!(
+                "GitHub issue #{number} was selected, but metadata could not be fetched."
+            ),
+            metadata_json: None,
+            warning: Some(format!(
+                "Install/authenticate the GitHub CLI (`gh`) or run in a GitHub-aware environment to fetch issue details. Fetch error: {error}"
+            )),
+        },
+    }
+}
+
+fn gh_issue_view(number: &str, repo: &Path) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args([
+            "issue",
+            "view",
+            number,
+            "--json",
+            "title,body,labels,comments,url,state,author",
+        ])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("cannot run gh: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn json_string_field(json: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\":\"");
+    let start = json.find(&needle)? + needle.len();
+    let mut escaped = false;
+    let mut value = String::new();
+    for char in json[start..].chars() {
+        if escaped {
+            value.push(match char {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                other => other,
+            });
+            escaped = false;
+        } else if char == '\\' {
+            escaped = true;
+        } else if char == '"' {
+            return Some(value);
+        } else {
+            value.push(char);
+        }
+    }
+    None
+}
+
+fn render_plan(
+    _parsed: &ParsedRun,
+    settings: &EffectiveSettings,
+    target_context: &TargetContext,
+    plan_only: bool,
+) -> String {
     let validation = settings
         .validation
         .iter()
@@ -730,8 +853,9 @@ fn render_plan(parsed: &ParsedRun, settings: &EffectiveSettings, plan_only: bool
         .join("\n");
 
     format!(
-        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
-        parsed.target.problem_statement(),
+        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Target context\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
+        target_context.problem_statement,
+        target_context.summary,
         validation,
         settings.write_mode.as_str(),
         settings.write_mode_source,
@@ -953,5 +1077,17 @@ mod tests {
         assert_eq!(parse_bool("true"), Some(true));
         assert_eq!(parse_bool("off"), Some(false));
         assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn extracts_simple_json_string_fields() {
+        let json =
+            r#"{"title":"Fix parser panic","state":"OPEN","url":"https://example.test/issue/1"}"#;
+        assert_eq!(
+            json_string_field(json, "title"),
+            Some("Fix parser panic".to_string())
+        );
+        assert_eq!(json_string_field(json, "state"), Some("OPEN".to_string()));
+        assert_eq!(json_string_field(json, "missing"), None);
     }
 }
