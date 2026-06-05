@@ -1,4 +1,5 @@
 /target
 
+.brokk/
 # Mjolnir linked worktrees
 .mjolnir/worktrees/
