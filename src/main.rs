@@ -654,10 +654,10 @@ impl EffectiveSettings {
             for command in &parsed.validations {
                 validation.push(Resolved::new(command.clone(), "cli"));
             }
-            if validation.is_empty() {
-                if let Some(command) = defaults.get("validation.command") {
-                    validation.push(command);
-                }
+            if validation.is_empty()
+                && let Some(command) = defaults.get("validation.command")
+            {
+                validation.push(command);
             }
             if validation.is_empty() {
                 validation.push(Resolved::new(infer_validation_command(), "inferred"));
