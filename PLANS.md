@@ -720,74 +720,103 @@ valkyrie attach <run-id>
 
 ### Milestone 1: Local task runner
 
-- Parse CLI args.
-- Resolve defaults without requiring config.
-- Create run directory.
-- Invoke anvil against local repo.
-- Write plan, logs, diff, and summary.
+Status: [~] In progress
+
+- [x] Parse CLI args.
+- [x] Resolve defaults without requiring config.
+- [x] Create run directory.
+- [ ] Invoke anvil against local repo.
+- [x] Write plan, logs, diff, and summary.
 
 ### Milestone 2: CLI-managed defaults
 
-- Implement `defaults get`.
-- Implement `defaults set`.
-- Implement `defaults unset`.
-- Implement `defaults export`.
-- Show effective settings and their sources.
-- Support repo-local and user-global defaults.
+Status: [~] In progress
+
+- [x] Implement `defaults get`.
+- [x] Implement `defaults set`.
+- [x] Implement `defaults unset`.
+- [x] Implement `defaults export`.
+- [x] Show effective settings and their sources.
+- [x] Support repo-local and user-global defaults.
 
 ### Milestone 3: GitHub issue support
 
-- Resolve `issue <number>` targets.
-- Fetch issue title, body, labels, and comments.
-- Create task context from issue metadata.
-- Generate local patch.
+Status: [~] In progress
+
+- [x] Resolve `issue <number>` targets.
+- [x] Fetch issue title, body, labels, and comments.
+- [x] Create task context from issue metadata.
+- [x] Generate local patch.
 
 ### Milestone 4: PR support
 
-- Resolve `pr <number>` targets.
-- Check out PR branch.
-- Read PR comments and review feedback.
-- Apply fixes locally.
-- Summarize changes for PR comment.
+Status: [ ] Not started
+
+- [ ] Resolve `pr <number>` targets.
+- [ ] Check out PR branch.
+- [ ] Read PR comments and review feedback.
+- [ ] Apply fixes locally.
+- [ ] Summarize changes for PR comment.
 
 ### Milestone 5: Validation loops
 
-- Run validation commands from flags, inferred defaults, or stored defaults.
-- Feed failures back into the agent.
-- Bound repair loops with iteration limits.
-- Produce validation report.
+Status: [~] In progress
+
+- [x] Run validation commands from flags, inferred defaults, or stored defaults.
+- [ ] Feed failures back into the agent.
+- [ ] Bound repair loops with iteration limits.
+- [x] Produce validation report.
 
 ### Milestone 6: TUI attach
 
-- Attach to live run.
-- Inspect completed run.
-- Show plan, logs, diffs, and validation.
-- Pause, resume, cancel, or approve actions.
-- Save interactive choices as defaults when requested.
+Status: [ ] Not started
+
+- [ ] Attach to live run.
+- [ ] Inspect completed run.
+- [ ] Show plan, logs, diffs, and validation.
+- [ ] Pause, resume, cancel, or approve actions.
+- [ ] Save interactive choices as defaults when requested.
 
 ### Milestone 7: Remote write support
 
-- Commit changes.
-- Push branches.
-- Open PRs.
-- Update PRs.
-- Post comments.
-- Add lifecycle labels.
+Status: [ ] Not started
+
+- [ ] Commit changes.
+- [ ] Push branches.
+- [ ] Open PRs.
+- [ ] Update PRs.
+- [ ] Post comments.
+- [ ] Add lifecycle labels.
 
 ### Milestone 8: Batch automation
 
-- Implement `sweep`.
-- Select issues by labels and filters.
-- Preview the queue in CLI/TUI.
-- Run isolated workspaces.
-- Enforce concurrency, budget, and failure limits.
+Status: [ ] Not started
+
+- [ ] Implement `sweep`.
+- [ ] Select issues by labels and filters.
+- [ ] Preview the queue in CLI/TUI.
+- [ ] Run isolated workspaces.
+- [ ] Enforce concurrency, budget, and failure limits.
 
 ### Milestone 9: CI failure repair
 
-- Fetch failed checks.
-- Parse logs.
-- Infer validation commands.
-- Patch and revalidate.
+Status: [ ] Not started
+
+- [ ] Fetch failed checks.
+- [ ] Parse logs.
+- [ ] Infer validation commands.
+- [ ] Patch and revalidate.
+
+## Milestone Progress
+
+Legend:
+
+- `[ ]` Not started or not yet verified.
+- `[~]` In progress.
+- `[x]` Done.
+- `[!]` Blocked.
+
+Progress markers in this section reflect the plan status only when they are intentionally updated. If implementation status is uncertain, leave the item unchecked rather than implying completion.
 
 ## Open Questions
 
