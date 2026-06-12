@@ -576,7 +576,6 @@ fn build_review_prompt(
     let mut prompt = format!(
         "You are Valkyrie, a GitHub pull request reviewer.\n\
          Review the pull request below and return a concise review summary plus actionable line comments.\n\
-         If structured output is unavailable, reply with a single JSON object matching this shape: {{\"summary\":\"...\",\"comments\":[{{\"path\":\"src/file.rs\",\"line\":12,\"body\":\"...\"}}]}}.\n\
          Only comment on real defects, regressions, security issues, missing tests, or maintainability problems.\n\
          Do not comment on style preferences unless they hide a real risk.\n\n\
          Repository: {repository}\n\
@@ -633,18 +632,15 @@ fn anvil_review(options: &AnvilOptions, prompt: &str) -> Result<GeneratedReview,
     client.initialize()?;
     let session_id = client.new_session(&cwd)?;
     client.set_config(&session_id, "permission_mode", "readOnly")?;
-    let output = client.prompt(&session_id, prompt)?;
-    if let Some(structured_output) = extract_structured_output(&output.response)? {
-        return serde_json::from_value(structured_output)
-            .map_err(|error| format!("Anvil returned invalid review JSON: {error}"));
-    }
-    review_from_text(&output.text)
+    let response = client.prompt(&session_id, prompt)?;
+    let output = extract_structured_output(&response)?;
+    serde_json::from_value(output)
+        .map_err(|error| format!("Anvil returned invalid review JSON: {error}"))
 }
 
-fn extract_structured_output(response: &Value) -> Result<Option<Value>, String> {
-    let Some(structured) = response.pointer("/_meta/anvil/structuredOutput") else {
-        return Ok(None);
-    };
+fn extract_structured_output(response: &Value) -> Result<Value, String> {
+    let structured = find_structured_output(response)
+        .ok_or_else(|| "Anvil response did not include structured output".to_string())?;
     let status = structured
         .get("status")
         .and_then(Value::as_str)
@@ -653,7 +649,6 @@ fn extract_structured_output(response: &Value) -> Result<Option<Value>, String> 
         "success" | "coerced_success" => structured
             .get("validated_output")
             .cloned()
-            .map(Some)
             .ok_or_else(|| "Anvil structured output did not include validated_output".to_string()),
         "validation_error" => Err(format!(
             "Anvil could not validate review output: {}",
@@ -668,58 +663,18 @@ fn extract_structured_output(response: &Value) -> Result<Option<Value>, String> 
     }
 }
 
-fn review_from_text(text: &str) -> Result<GeneratedReview, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("Anvil returned neither structured output nor review text".to_string());
-    }
-    if let Some(json_text) = extract_first_json_object(trimmed)
-        && let Ok(review) = serde_json::from_str::<GeneratedReview>(&json_text)
+fn find_structured_output(value: &Value) -> Option<&Value> {
+    if let Some(found) = value
+        .get("anvil")
+        .and_then(|anvil| anvil.get("structuredOutput"))
     {
-        return Ok(review);
+        return Some(found);
     }
-    Ok(GeneratedReview {
-        summary: trimmed.to_string(),
-        comments: Vec::new(),
-    })
-}
-
-fn extract_first_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let mut depth = 0_u32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, character) in text[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match character {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    let end = start + offset + character.len_utf8();
-                    return Some(text[start..end].to_string());
-                }
-            }
-            _ => {}
-        }
+    match value {
+        Value::Array(items) => items.iter().find_map(find_structured_output),
+        Value::Object(map) => map.values().find_map(find_structured_output),
+        _ => None,
     }
-    None
-}
-
-struct AcpPromptOutput {
-    response: Value,
-    text: String,
 }
 
 struct AcpClient {
@@ -803,14 +758,10 @@ impl AcpClient {
         .map(|_| ())
     }
 
-    fn prompt(&mut self, session_id: &str, prompt: &str) -> Result<AcpPromptOutput, String> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "session/prompt",
-            "params": {
+    fn prompt(&mut self, session_id: &str, prompt: &str) -> Result<Value, String> {
+        self.request(
+            "session/prompt",
+            json!({
                 "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": prompt }],
                 "_meta": {
@@ -822,16 +773,8 @@ impl AcpClient {
                         }
                     }
                 }
-            }
-        });
-        writeln!(self.stdin, "{request}")
-            .map_err(|error| format!("cannot write ACP prompt request: {error}"))?;
-        self.stdin
-            .flush()
-            .map_err(|error| format!("cannot flush ACP prompt request: {error}"))?;
-        let mut text = String::new();
-        let response = self.read_response(id, Some(&mut text))?;
-        Ok(AcpPromptOutput { response, text })
+            }),
+        )
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -848,14 +791,10 @@ impl AcpClient {
         self.stdin
             .flush()
             .map_err(|error| format!("cannot flush ACP request `{method}`: {error}"))?;
-        self.read_response(id, None)
+        self.read_response(id)
     }
 
-    fn read_response(
-        &mut self,
-        id: u64,
-        mut text_output: Option<&mut String>,
-    ) -> Result<Value, String> {
+    fn read_response(&mut self, id: u64) -> Result<Value, String> {
         let mut line = String::new();
         loop {
             line.clear();
@@ -869,11 +808,6 @@ impl AcpClient {
             let message: Value = serde_json::from_str(line.trim())
                 .map_err(|error| format!("Anvil returned invalid JSON-RPC: {error}: {line}"))?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
-                if let Some(text_output) = text_output.as_deref_mut()
-                    && let Some(chunk) = extract_agent_message_chunk(&message)
-                {
-                    text_output.push_str(&chunk);
-                }
                 continue;
             }
             if let Some(error) = message.get("error") {
@@ -884,33 +818,6 @@ impl AcpClient {
                 .cloned()
                 .ok_or_else(|| "Anvil ACP response did not include result".to_string());
         }
-    }
-}
-
-fn extract_agent_message_chunk(message: &Value) -> Option<String> {
-    if message.get("method").and_then(Value::as_str) != Some("session/update") {
-        return None;
-    }
-    let update = message.pointer("/params/update")?;
-    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
-        return None;
-    }
-    extract_text_from_content(update.get("content")?)
-}
-
-fn extract_text_from_content(content: &Value) -> Option<String> {
-    if let Some(text) = content.get("text").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
-    let texts = content
-        .as_array()?
-        .iter()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    if texts.is_empty() {
-        None
-    } else {
-        Some(texts.join(""))
     }
 }
 
@@ -1013,7 +920,7 @@ mod tests {
     #[test]
     fn extracts_successful_structured_output() {
         let value = json!({
-            "_meta": {
+            "meta": {
                 "anvil": {
                     "structuredOutput": {
                         "status": "success",
@@ -1028,35 +935,29 @@ mod tests {
             }
         });
         let output = extract_structured_output(&value).expect("structured output");
-        assert_eq!(output.expect("validated output")["summary"], "Summary");
+        assert_eq!(output["summary"], "Summary");
     }
 
     #[test]
-    fn builds_review_from_json_text_fallback() {
-        let text = r#"Here is the review:
-{"summary":"Fallback summary","comments":[{"path":"src/main.rs","line":42,"body":"Check this."}]}"#;
-        let review = review_from_text(text).expect("review from text");
-        assert_eq!(review.summary, "Fallback summary");
-        assert_eq!(review.comments.len(), 1);
-        assert_eq!(review.comments[0].line, Some(42));
-    }
-
-    #[test]
-    fn collects_agent_message_chunk_text() {
-        let message = json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "s1",
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": { "type": "text", "text": "hello" }
+    fn finds_structured_output_in_nested_anvil_metadata() {
+        let value = json!({
+            "result": {
+                "_meta": {
+                    "anvil": {
+                        "structuredOutput": {
+                            "status": "success",
+                            "schema_name": "valkyrie_pr_review",
+                            "validated_output": {
+                                "summary": "Nested",
+                                "comments": []
+                            },
+                            "coercion_requested": false
+                        }
+                    }
                 }
             }
         });
-        assert_eq!(
-            extract_agent_message_chunk(&message).as_deref(),
-            Some("hello")
-        );
+        let output = extract_structured_output(&value).expect("structured output");
+        assert_eq!(output["summary"], "Nested");
     }
 }
