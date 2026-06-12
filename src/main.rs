@@ -277,16 +277,16 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
 
 fn command_pr(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: vk pr <number> [--repo <path>] [--fix] [--plan]".to_string());
+        return Err("usage: vk pr <number> [--repo <path>] [--plan]".to_string());
     }
 
     let mut rewritten = vec!["pr".to_string(), args[0].clone()];
     let mut plan_only = false;
     for arg in args.into_iter().skip(1) {
-        match arg.as_str() {
-            "--plan" => plan_only = true,
-            "--fix" => {}
-            _ => rewritten.push(arg),
+        if arg == "--plan" {
+            plan_only = true;
+        } else {
+            rewritten.push(arg);
         }
     }
     execute_target_run(rewritten, plan_only)
@@ -394,12 +394,10 @@ fn command_review(args: Vec<String>) -> Result<(), String> {
     }
     let review = fs::read_to_string(&review_path).unwrap_or_default();
 
-    let post = if parsed.post_comment && agent.success {
+    let post = if agent.success {
         post_pr_review(&repo, &parsed, &review_path)?
-    } else if parsed.post_comment {
-        WriteActionOutcome::requested_skipped("agent failed before posting the review")
     } else {
-        WriteActionOutcome::skipped("not requested")
+        WriteActionOutcome::requested_skipped("agent failed before posting the review")
     };
     write_text(run_dir.join("write-actions.md"), &post.to_markdown())?;
 
@@ -701,7 +699,6 @@ struct ParsedReview {
     number: String,
     repo: PathBuf,
     plan_only: bool,
-    post_comment: bool,
     decision: ReviewDecision,
     json: bool,
     verbose: bool,
@@ -712,7 +709,6 @@ impl ParsedReview {
         let mut number: Option<String> = None;
         let mut repo = PathBuf::from(".");
         let mut plan_only = false;
-        let mut post_comment = false;
         let mut decision = ReviewDecision::Comment;
         let mut json = false;
         let mut verbose = false;
@@ -727,7 +723,6 @@ impl ParsedReview {
                 "--approve" => decision = ReviewDecision::Approve,
                 "--request-changes" => decision = ReviewDecision::RequestChanges,
                 "--plan" => plan_only = true,
-                "--post-comment" | "--post-review" => post_comment = true,
                 "--json" => json = true,
                 "--verbose" => verbose = true,
                 flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
@@ -743,7 +738,6 @@ impl ParsedReview {
             number,
             repo,
             plan_only,
-            post_comment,
             decision,
             json,
             verbose,
@@ -752,21 +746,12 @@ impl ParsedReview {
 }
 
 fn render_review_plan(parsed: &ParsedReview, target_context: &TargetContext) -> String {
-    let post = if parsed.post_comment {
-        format!(
-            "Submit a `{}` review to GitHub after analysis.",
-            parsed.decision.as_str()
-        )
-    } else {
-        "Keep the review local; remote submission is disabled.".to_string()
-    };
-
     format!(
-        "# Valkyrie PR Review Plan\n\n## Target\n\n{}\n\n## Summary\n\n{}\n\n## Proposed execution\n\n- Fetch PR metadata and diff with the GitHub CLI.\n- Ask the ACP agent to analyze the diff without modifying the working tree.\n- Capture the review as `review.md` in the run directory.\n\n## Decision\n\n- Recommendation: `{}`\n- {}\n\n## Stop conditions\n\n- Never modify the working tree during a review.\n- Do not submit a remote review unless `--post-comment` is present.\n",
+        "# Valkyrie PR Review Plan\n\n## Target\n\n{}\n\n## Summary\n\n{}\n\n## Proposed execution\n\n- Fetch PR metadata and diff with the GitHub CLI.\n- Ask the ACP agent to analyze the diff without modifying the working tree.\n- Capture the review as `review.md` in the run directory.\n- Submit a `{}` review to GitHub after analysis.\n\n## Decision\n\n- Recommendation: `{}`\n\n## Stop conditions\n\n- Never modify the working tree during a review.\n- Do not submit a remote review until the agent finishes producing it.\n",
         target_context.problem_statement,
         target_context.summary,
         parsed.decision.as_str(),
-        post
+        parsed.decision.as_str(),
     )
 }
 
@@ -2664,7 +2649,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>] [--post-comment]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -3070,13 +3055,12 @@ mod tests {
     }
 
     #[test]
-    fn parsed_review_defaults_to_local_comment_review() {
+    fn parsed_review_defaults_to_comment_review() {
         let parsed = ParsedReview::parse(vec!["456".to_string()]).unwrap();
 
         assert_eq!(parsed.number, "456");
         assert_eq!(parsed.repo, PathBuf::from("."));
         assert!(!parsed.plan_only);
-        assert!(!parsed.post_comment);
         assert_eq!(parsed.decision, ReviewDecision::Comment);
         assert!(!parsed.json);
         assert!(!parsed.verbose);
@@ -3089,7 +3073,6 @@ mod tests {
             "--repo".to_string(),
             ".".to_string(),
             "--request-changes".to_string(),
-            "--post-comment".to_string(),
             "--json".to_string(),
             "--verbose".to_string(),
             "--plan".to_string(),
@@ -3098,7 +3081,6 @@ mod tests {
 
         assert_eq!(parsed.number, "789");
         assert_eq!(parsed.decision, ReviewDecision::RequestChanges);
-        assert!(parsed.post_comment);
         assert!(parsed.json);
         assert!(parsed.verbose);
         assert!(parsed.plan_only);
@@ -3131,7 +3113,7 @@ mod tests {
     }
 
     #[test]
-    fn render_review_plan_reflects_post_choice() {
+    fn render_review_plan_always_submits_review() {
         let context = TargetContext {
             problem_statement: "Fix GitHub PR #456".to_string(),
             summary: "PR context".to_string(),
@@ -3139,19 +3121,15 @@ mod tests {
             warning: None,
         };
 
-        let local = ParsedReview::parse(vec!["456".to_string()]).unwrap();
-        let plan = render_review_plan(&local, &context);
+        let parsed = ParsedReview::parse(vec!["456".to_string()]).unwrap();
+        let plan = render_review_plan(&parsed, &context);
         assert!(plan.contains("# Valkyrie PR Review Plan"));
         assert!(plan.contains("Recommendation: `comment`"));
-        assert!(plan.contains("remote submission is disabled"));
+        assert!(plan.contains("Submit a `comment` review"));
 
-        let remote = ParsedReview::parse(vec![
-            "456".to_string(),
-            "--approve".to_string(),
-            "--post-comment".to_string(),
-        ])
-        .unwrap();
-        let plan = render_review_plan(&remote, &context);
+        let approve =
+            ParsedReview::parse(vec!["456".to_string(), "--approve".to_string()]).unwrap();
+        let plan = render_review_plan(&approve, &context);
         assert!(plan.contains("Submit a `approve` review"));
     }
 
@@ -3222,12 +3200,8 @@ mod tests {
             metadata_json: None,
             warning: None,
         };
-        let parsed = ParsedReview::parse(vec![
-            "99".to_string(),
-            "--request-changes".to_string(),
-            "--post-comment".to_string(),
-        ])
-        .unwrap();
+        let parsed =
+            ParsedReview::parse(vec!["99".to_string(), "--request-changes".to_string()]).unwrap();
 
         let plan = render_review_plan(&parsed, &context);
         assert!(plan.contains("Recommendation: `request-changes`"));

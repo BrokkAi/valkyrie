@@ -87,13 +87,13 @@ Expected behavior:
 ### Fix a pull request
 
 ```bash
-valkyrie pr 456 --fix
+valkyrie pr 456
 ```
 
-Equivalent explicit form:
+Plan-only form:
 
 ```bash
-valkyrie fix pr 456
+valkyrie pr 456 --plan
 ```
 
 Expected behavior:
@@ -190,7 +190,7 @@ Expected behavior:
 
 ```bash
 valkyrie issue <number>
-valkyrie pr <number> [--fix]
+valkyrie pr <number>
 valkyrie ci --pr <number> [--fix]
 valkyrie sweep [filters]
 valkyrie patrol [repo]
@@ -215,7 +215,7 @@ valkyrie issue 123
 valkyrie issue 123 --plan
 valkyrie issue 123 --commit
 valkyrie issue 123 --commit --push --open-pr
-valkyrie pr 456 --fix
+valkyrie pr 456
 valkyrie ci --pr 456 --fix
 valkyrie sweep --label ready-for-agent --max 5
 valkyrie patrol --label bug --max 5
@@ -709,7 +709,7 @@ MVP commands:
 
 ```bash
 valkyrie issue 123 --repo .
-valkyrie pr 456 --fix --repo .
+valkyrie pr 456 --repo .
 valkyrie issue 123 --plan --repo .
 valkyrie defaults set validation.command "cargo test"
 valkyrie status <run-id>
@@ -957,7 +957,7 @@ trait TuiController {
 
 1. Keep `valkyrie` as the working CLI name.
 2. Define the `Target`, `RunRecord`, and `EffectiveSettings` data models.
-3. Implement direct shortcuts like `valkyrie issue 123` and `valkyrie pr 456 --fix`.
+3. Implement direct shortcuts like `valkyrie issue 123` and `valkyrie pr 456`.
 4. Implement CLI-managed defaults before any hand-authored YAML requirement.
 5. Add GitHub issue resolution.
 6. Wire anvil execution with bifrost context.
