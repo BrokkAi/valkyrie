@@ -22,6 +22,9 @@ jobs:
       contents: read
       id-token: write
 
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
     steps:
       - uses: actions/checkout@v6
 
@@ -56,13 +59,24 @@ jobs:
       - name: Verify package
         run: cargo publish --dry-run -p brokk-valkryie --locked
 
-      - name: Authenticate with crates.io
-        if: github.event_name == 'push' || github.event.inputs.publish == 'true'
-        id: auth
+      - name: Authenticate with crates.io trusted publishing
+        if: env.CARGO_REGISTRY_TOKEN == '' && (github.event_name == 'push' || github.event.inputs.publish == 'true')
+        id: trusted_publishing
+        continue-on-error: true
         uses: rust-lang/crates-io-auth-action@v1.0.4
 
-      - name: Publish crate
-        if: github.event_name == 'push' || github.event.inputs.publish == 'true'
+      - name: Publish crate with token secret
+        if: env.CARGO_REGISTRY_TOKEN != '' && (github.event_name == 'push' || github.event.inputs.publish == 'true')
+        run: cargo publish -p brokk-valkryie --locked
+
+      - name: Publish crate with trusted publishing
+        if: env.CARGO_REGISTRY_TOKEN == '' && steps.trusted_publishing.outcome == 'success' && (github.event_name == 'push' || github.event.inputs.publish == 'true')
         run: cargo publish -p brokk-valkryie --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.trusted_publishing.outputs.token }}
+
+      - name: Report missing crates.io publishing credentials
+        if: env.CARGO_REGISTRY_TOKEN == '' && steps.trusted_publishing.outcome != 'success' && (github.event_name == 'push' || github.event.inputs.publish == 'true')
+        run: |
+          echo "::warning::Crate publish skipped because neither repository secret CARGO_REGISTRY_TOKEN nor crates.io Trusted Publishing is configured."
+          echo "Configure crates.io Trusted Publishing for BrokkAi/valkyrie or add a repository secret named CARGO_REGISTRY_TOKEN, then rerun this workflow with publish=true."
