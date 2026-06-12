@@ -4,7 +4,7 @@ Instructions for agents working on this repository.
 
 ## Project context
 
-Valkyrie is a Rust CLI for agentic automation. It is intended to plan, execute, validate, and report software changes in repositories. The project should remain CLI/TUI first, safe by default, and produce inspectable run records.
+Valkyrie is a Rust CLI that watches GitHub repositories for open pull requests, asks Anvil to generate pull request review content, and posts GitHub pull request reviews. The crate is published as `brokk-valkryie`; the binary is `vk`.
 
 ## Language policy
 
@@ -12,7 +12,6 @@ All code, comments, documentation, CLI text, error messages, tests, and generate
 
 ## General expectations
 
-- Read `PLANS.md` before changing product behavior or CLI shape.
 - Keep changes small, focused, and easy to review.
 - Preserve existing behavior unless the requested task explicitly changes it.
 - Document non-obvious decisions in code comments or in the final change summary.
@@ -63,8 +62,8 @@ cargo test
 
 Valkyrie may orchestrate changes across repositories and remote services, so agents must be careful:
 
-- Do not enable remote writes, pushes, PR creation, or remote comments without an explicit option.
-- Keep safe modes as the default.
+- Do not enable pushes, PR creation, or unrelated remote writes without an explicit option.
+- Pull request review comments are the core product behavior. Keep duplicate-post prevention working before changing review posting behavior.
 - Be careful with shell commands constructed from user input.
 - Avoid exposing secrets in logs, reports, or error messages.
 

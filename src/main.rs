@@ -1,10 +1,16 @@
-use std::collections::BTreeMap;
-use std::env;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::str::FromStr;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use clap::{CommandFactory, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 fn main() {
     if let Err(error) = run() {
@@ -14,1310 +20,827 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
-
-    if args.is_empty() {
-        print_help();
-        return Ok(());
-    }
-
-    let command = args.remove(0);
-    match command.as_str() {
-        "run" => command_run(args, false),
-        "plan" => command_plan(args),
-        "issue" => command_issue(args),
-        "pr" => command_pr(args),
-        "defaults" => command_defaults(args),
-        "status" => command_show_artifact(args, "result.json"),
-        "logs" => command_show_artifact(args, "events.jsonl"),
-        "diff" => command_show_artifact(args, "diff.patch"),
-        "doctor" => command_doctor(),
-        "help" | "--help" | "-h" => {
-            print_help();
+    let cli = Cli::parse();
+    match cli.command {
+        Some(CommandKind::Watch(args)) => run_watch(args),
+        Some(CommandKind::Doctor) => run_doctor(),
+        None => {
+            Cli::command()
+                .print_help()
+                .map_err(|error| error.to_string())?;
+            println!();
             Ok(())
         }
-        other => Err(format!(
-            "unknown command `{other}`. Run `valkyrie help` for usage."
-        )),
     }
 }
 
-fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
-    let parsed = ParsedRun::parse(args, plan_only)?;
-    let repo = resolve_repo(&parsed.repo)?;
-    let defaults = DefaultsResolver::load(&repo)?;
-    let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-    let target_context = resolve_target_context(&parsed.target, &repo);
-    let run_id = make_run_id(&parsed.target.slug());
-    let run_dir = repo.join(".valkyrie").join("runs").join(&run_id);
-    fs::create_dir_all(&run_dir).map_err(|error| {
+#[derive(Parser)]
+#[command(
+    name = "vk",
+    version,
+    about = "Watch GitHub pull requests and review them with Anvil"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CommandKind>,
+}
+
+#[derive(Subcommand)]
+enum CommandKind {
+    /// Poll GitHub repositories for open pull requests and review new ones.
+    Watch(WatchArgs),
+    /// Check local runtime dependencies.
+    Doctor,
+}
+
+#[derive(Parser, Debug)]
+struct WatchArgs {
+    /// Repository to watch, in owner/name form. Can be passed more than once.
+    #[arg(short = 'r', long = "repo", value_name = "OWNER/REPO")]
+    repos: Vec<RepoSlug>,
+
+    /// Additional repositories to watch, in owner/name form.
+    #[arg(value_name = "OWNER/REPO")]
+    positional_repos: Vec<RepoSlug>,
+
+    /// Polling interval in seconds.
+    #[arg(long, default_value_t = 60)]
+    interval_seconds: u64,
+
+    /// Local directory used to remember reviewed pull requests.
+    #[arg(long, default_value = ".valkyrie")]
+    state_dir: PathBuf,
+
+    /// Poll once, then exit.
+    #[arg(long)]
+    once: bool,
+
+    /// Fetch pull requests and build prompts without invoking Anvil or posting reviews.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Maximum open pull requests fetched per repository per poll.
+    #[arg(long, default_value_t = 50)]
+    limit: u8,
+
+    /// Anvil binary to launch as the ACP server.
+    #[arg(long, default_value = "anvil")]
+    anvil_binary: String,
+
+    /// Optional default model forwarded to Anvil.
+    #[arg(long)]
+    default_model: Option<String>,
+
+    /// Maximum Anvil tool-calling turns per prompt.
+    #[arg(long, default_value_t = 25)]
+    max_turns: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct RepoSlug {
+    owner: String,
+    name: String,
+}
+
+impl RepoSlug {
+    fn as_path(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    fn review_marker(&self, number: u64) -> String {
+        format!("<!-- valkyrie-review: {}#{} -->", self.as_path(), number)
+    }
+}
+
+impl fmt::Display for RepoSlug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.owner, self.name)
+    }
+}
+
+impl FromStr for RepoSlug {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let (owner, name) = input
+            .split_once('/')
+            .ok_or_else(|| format!("repository `{input}` must use owner/name form"))?;
+        validate_slug_part(owner, "owner")?;
+        validate_slug_part(name, "repository")?;
+        Ok(Self {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+fn validate_slug_part(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("repository {label} cannot be empty"));
+    }
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_' || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "repository {label} `{value}` contains unsupported characters"
+        ))
+    }
+}
+
+fn run_watch(args: WatchArgs) -> Result<(), String> {
+    let repositories = merge_repositories(args.repos.clone(), args.positional_repos.clone())?;
+    fs::create_dir_all(&args.state_dir).map_err(|error| {
         format!(
-            "cannot create run directory `{}`: {error}",
-            run_dir.display()
+            "cannot create state directory `{}`: {error}",
+            args.state_dir.display()
         )
     })?;
 
-    let plan = render_plan(&parsed, &settings, &target_context, plan_only);
-    write_text(
-        run_dir.join("target.json"),
-        &render_target_json(&parsed.target, &repo),
-    )?;
-    write_text(run_dir.join("effective-settings.json"), &settings.to_json())?;
-    write_text(run_dir.join("context.md"), &target_context.to_markdown())?;
-    if let Some(metadata_json) = &target_context.metadata_json {
-        let metadata_file = match &parsed.target {
-            Target::Issue(_) => "issue.json",
-            Target::PullRequest(_) => "pr.json",
-            Target::LocalTask(_) => "metadata.json",
-        };
-        write_text(run_dir.join(metadata_file), metadata_json)?;
-    }
-    write_text(run_dir.join("plan.md"), &plan)?;
-    write_text(
-        run_dir.join("events.jsonl"),
-        &format!(
-            "{{\"event\":\"run_created\",\"run_id\":\"{}\",\"mode\":\"{}\"}}\n",
-            escape_json(&run_id),
-            if plan_only {
-                "plan"
-            } else {
-                settings.write_mode.as_str()
-            }
-        ),
-    )?;
+    let github = GitHubClient::new();
+    let viewer = github.current_user()?;
+    let state_path = args.state_dir.join("reviews.json");
+    let mut state = ReviewState::load(&state_path)?;
 
-    if parsed.json {
-        println!("{}", render_created_json(&run_id, &run_dir, plan_only));
-    } else {
-        println!("Run created: {run_id}");
-        println!("Artifacts: {}", run_dir.display());
-        println!();
-        println!("{plan}");
-        if parsed.verbose || parsed.dry_run || plan_only {
-            println!();
-            println!("{}", settings.render_human());
+    loop {
+        for repository in &repositories {
+            poll_repository(repository, &args, &github, &viewer, &state_path, &mut state)?;
         }
-    }
 
-    if plan_only || settings.write_mode == WriteMode::NoWrite {
-        write_text(run_dir.join("diff.patch"), "")?;
-        write_text(
-            run_dir.join("validation.md"),
-            "# Validation
+        if args.once {
+            break;
+        }
 
-Validation was not run because this was a planning/no-write run.
-",
-        )?;
-        write_text(
-            run_dir.join("summary.md"),
-            "# Summary
-
-Planning completed. No files were modified by Valkyrie.
-",
-        )?;
-        write_text(
-            run_dir.join("result.json"),
-            &format!(
-                "{{\n  \"run_id\": \"{}\",\n  \"state\": \"planned\",\n  \"run_dir\": \"{}\"\n}}\n",
-                escape_json(&run_id),
-                escape_json(&run_dir.display().to_string())
-            ),
-        )?;
-        return Ok(());
-    }
-
-    let diff = git_output(&repo, &["diff", "--"])?;
-    write_text(run_dir.join("diff.patch"), &diff)?;
-
-    let validation = run_validation(&repo, &settings)?;
-    write_text(run_dir.join("validation.md"), &validation.to_markdown())?;
-    let state = if validation.failed() {
-        "failed"
-    } else if validation.skipped {
-        "planned"
-    } else {
-        "validated"
-    };
-
-    write_text(
-        run_dir.join("summary.md"),
-        &format!(
-            "# Summary
-
-Run record created. Agent execution is not wired yet; this MVP skeleton records the target, settings, plan, logs, current diff, and validation result.
-
-Validation state: `{state}`.
-"
-        ),
-    )?;
-    write_text(
-        run_dir.join("result.json"),
-        &format!(
-            r#"{{
-  "run_id": "{}",
-  "state": "{}",
-  "run_dir": "{}",
-  "agent_invoked": false,
-  "validation": {{ "skipped": {}, "failed": {} }}
-}}
-"#,
-            escape_json(&run_id),
-            state,
-            escape_json(&run_dir.display().to_string()),
-            validation.skipped,
-            validation.failed()
-        ),
-    )?;
-
-    if validation.failed() {
-        return Err(format!(
-            "validation failed for run `{}`. See `{}`",
-            run_id,
-            run_dir.join("validation.md").display()
-        ));
+        thread::sleep(Duration::from_secs(args.interval_seconds));
     }
 
     Ok(())
 }
 
-fn command_plan(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: valkyrie plan <task>|issue <number> [--repo <path>]".to_string());
+fn merge_repositories(
+    mut flag_repos: Vec<RepoSlug>,
+    positional_repos: Vec<RepoSlug>,
+) -> Result<Vec<RepoSlug>, String> {
+    flag_repos.extend(positional_repos);
+    if flag_repos.is_empty() {
+        return Err("watch requires at least one repository".to_string());
     }
 
-    command_run(rewrite_target_alias(args), true)
-}
-
-fn command_issue(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: valkyrie issue <number> [--repo <path>] [--plan]".to_string());
-    }
-
-    let mut rewritten = vec!["issue".to_string(), args[0].clone()];
-    let mut plan_only = false;
-    for arg in args.into_iter().skip(1) {
-        if arg == "--plan" {
-            plan_only = true;
-        } else {
-            rewritten.push(arg);
+    let mut seen = BTreeSet::new();
+    let mut repositories = Vec::new();
+    for repository in flag_repos {
+        if seen.insert(repository.clone()) {
+            repositories.push(repository);
         }
     }
-    command_run(rewritten, plan_only)
+    Ok(repositories)
 }
 
-fn command_pr(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: valkyrie pr <number> [--repo <path>] [--fix] [--plan]".to_string());
-    }
-
-    let mut rewritten = vec!["pr".to_string(), args[0].clone()];
-    let mut plan_only = false;
-    for arg in args.into_iter().skip(1) {
-        match arg.as_str() {
-            "--plan" => plan_only = true,
-            "--fix" => {}
-            _ => rewritten.push(arg),
-        }
-    }
-    command_run(rewritten, plan_only)
-}
-
-fn command_defaults(args: Vec<String>) -> Result<(), String> {
-    let defaults_args = DefaultsArgs::parse(args)?;
-    let repo = resolve_repo(&defaults_args.repo)?;
-    let scope = defaults_args.scope;
-    let action = defaults_args.action;
-    let path = defaults_path(&repo, scope)?;
-    let mut store = DefaultsStore::load(&path)?;
-
-    match action {
-        DefaultsAction::Get(key) => {
-            if let Some(key) = key {
-                match store.values.get(&key) {
-                    Some(value) => println!("{value}"),
-                    None => return Err(format!("default `{key}` is not set in {scope}")),
-                }
-            } else if store.values.is_empty() {
-                println!("No {scope} defaults set.");
-            } else {
-                for (key, value) in &store.values {
-                    println!("{key}={value}");
-                }
-            }
-        }
-        DefaultsAction::Set(key, value) => {
-            store.values.insert(key.clone(), value.clone());
-            store.save(&path)?;
-            println!("Set {scope} default {key}={value}");
-        }
-        DefaultsAction::Unset(key) => {
-            store.values.remove(&key);
-            store.save(&path)?;
-            println!("Unset {scope} default {key}");
-        }
-        DefaultsAction::Export => {
-            print!("{}", store.to_yaml(scope));
-            io::stdout().flush().map_err(|error| error.to_string())?;
-        }
-    }
-
-    Ok(())
-}
-
-fn command_show_artifact(args: Vec<String>, artifact: &str) -> Result<(), String> {
-    let Some(run_id) = args.first() else {
-        return Err(format!(
-            "usage: valkyrie {} <run-id|latest>",
-            artifact_command_name(artifact)
-        ));
-    };
-    let repo = current_repo()?;
-    let run_dir = resolve_run_dir(&repo, run_id)?;
-    let content = fs::read_to_string(run_dir.join(artifact))
-        .map_err(|error| format!("cannot read `{}` for run `{}`: {error}", artifact, run_id))?;
-    print!("{content}");
-    Ok(())
-}
-
-fn command_doctor() -> Result<(), String> {
-    println!("Valkyrie doctor");
-    println!(
-        "git: {}",
-        if command_exists("git") {
-            "ok"
-        } else {
-            "missing"
-        }
-    );
-    println!("repo: {}", current_repo()?.display());
-    println!(
-        "repo defaults: {}",
-        current_repo()?.join(".valkyrie/defaults.env").display()
-    );
-    println!("user defaults: {}", user_defaults_path()?.display());
-    println!(
-        "anvil: {}",
-        if command_exists("anvil") {
-            "ok"
-        } else {
-            "missing"
-        }
-    );
-    Ok(())
-}
-
-#[derive(Debug)]
-struct ParsedRun {
-    target: Target,
-    repo: PathBuf,
-    dry_run: bool,
-    no_write: bool,
-    write: bool,
-    commit: bool,
-    push: bool,
-    open_pr: bool,
-    post_comment: bool,
-    json: bool,
-    verbose: bool,
-    skip_validation: bool,
-    validations: Vec<String>,
-}
-
-impl ParsedRun {
-    fn parse(args: Vec<String>, plan_only: bool) -> Result<Self, String> {
-        let mut task_parts = Vec::new();
-        let mut repo = PathBuf::from(".");
-        let mut dry_run = false;
-        let mut no_write = plan_only;
-        let mut write = false;
-        let mut commit = false;
-        let mut push = false;
-        let mut open_pr = false;
-        let mut post_comment = false;
-        let mut json = false;
-        let mut verbose = false;
-        let mut skip_validation = false;
-        let mut validations = Vec::new();
-
-        let mut iter = args.into_iter();
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "--repo" => repo = PathBuf::from(next_value(&mut iter, "--repo")?),
-                "--validate" => validations.push(next_value(&mut iter, "--validate")?),
-                "--dry-run" => dry_run = true,
-                "--no-write" => no_write = true,
-                "--write" => write = true,
-                "--commit" => commit = true,
-                "--push" => push = true,
-                "--open-pr" => open_pr = true,
-                "--post-comment" => post_comment = true,
-                "--json" => json = true,
-                "--verbose" => verbose = true,
-                "--skip-validation" => skip_validation = true,
-                flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
-                value => task_parts.push(value.to_string()),
-            }
+fn poll_repository(
+    repository: &RepoSlug,
+    args: &WatchArgs,
+    github: &GitHubClient,
+    viewer: &GitHubUser,
+    state_path: &Path,
+    state: &mut ReviewState,
+) -> Result<(), String> {
+    println!("polling {repository}");
+    let pulls = github.open_pull_requests(repository, args.limit)?;
+    for pull in pulls {
+        let state_key = review_state_key(repository, pull.number);
+        if state.reviews.contains_key(&state_key) {
+            println!("skipping {repository}#{}: already recorded", pull.number);
+            continue;
         }
 
-        if task_parts.is_empty() {
-            return Err("usage: valkyrie run <task> [--repo <path>]".to_string());
-        }
-
-        Ok(Self {
-            target: Target::from_parts(task_parts),
-            repo,
-            dry_run,
-            no_write,
-            write,
-            commit,
-            push,
-            open_pr,
-            post_comment,
-            json,
-            verbose,
-            skip_validation,
-            validations,
-        })
-    }
-}
-
-#[derive(Debug)]
-enum Target {
-    LocalTask(String),
-    Issue(String),
-    PullRequest(String),
-}
-
-impl Target {
-    fn from_parts(parts: Vec<String>) -> Self {
-        if parts.len() >= 2 && parts[0] == "issue" {
-            Self::Issue(parts[1].clone())
-        } else if parts.len() >= 2 && parts[0] == "pr" {
-            Self::PullRequest(parts[1].clone())
-        } else {
-            Self::LocalTask(parts.join(" "))
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::LocalTask(_) => "local-task",
-            Self::Issue(_) => "github-issue",
-            Self::PullRequest(_) => "github-pr",
-        }
-    }
-
-    fn slug(&self) -> String {
-        match self {
-            Self::LocalTask(task) => slugify(task),
-            Self::Issue(number) => format!("issue-{number}"),
-            Self::PullRequest(number) => format!("pr-{number}"),
-        }
-    }
-}
-
-fn rewrite_target_alias(args: Vec<String>) -> Vec<String> {
-    if args.len() >= 2 && (args[0] == "issue" || args[0] == "pr") {
-        let mut rewritten = vec![args[0].clone(), args[1].clone()];
-        rewritten.extend(args.into_iter().skip(2));
-        rewritten
-    } else {
-        args
-    }
-}
-
-#[derive(Clone, Copy)]
-enum DefaultsScope {
-    Repo,
-    User,
-}
-
-impl std::fmt::Display for DefaultsScope {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Repo => write!(formatter, "repo"),
-            Self::User => write!(formatter, "user"),
-        }
-    }
-}
-
-enum DefaultsAction {
-    Get(Option<String>),
-    Set(String, String),
-    Unset(String),
-    Export,
-}
-
-struct DefaultsArgs {
-    scope: DefaultsScope,
-    repo: PathBuf,
-    action: DefaultsAction,
-}
-
-impl DefaultsArgs {
-    fn parse(args: Vec<String>) -> Result<Self, String> {
-        if args.is_empty() {
-            return Err(
-                "usage: valkyrie defaults [--repo <path>] [--global] <get|set|unset|export>"
-                    .to_string(),
+        let marker = repository.review_marker(pull.number);
+        if github.review_already_posted(repository, pull.number, &viewer.login, &marker)? {
+            println!(
+                "skipping {repository}#{}: existing Valkyrie review found",
+                pull.number
             );
+            state.record(repository, &pull, None);
+            state.save(state_path)?;
+            continue;
         }
 
-        let mut scope = DefaultsScope::Repo;
-        let mut repo = PathBuf::from(".");
-        let mut positional = Vec::new();
-        let mut iter = args.into_iter();
-        while let Some(arg) = iter.next() {
-            match arg.as_str() {
-                "--global" | "--user" => scope = DefaultsScope::User,
-                "--repo" => repo = PathBuf::from(next_value(&mut iter, "--repo")?),
-                flag if flag.starts_with('-') => {
-                    return Err(format!("unknown defaults flag `{flag}`"));
-                }
-                value => positional.push(value.to_string()),
-            }
-        }
-
-        if positional.is_empty() {
-            return Err(
-                "usage: valkyrie defaults <get|set|unset|export> [key] [value]".to_string(),
+        let files = github.pull_request_files(repository, pull.number)?;
+        let prompt = build_review_prompt(repository, &pull, &files);
+        if args.dry_run {
+            println!(
+                "dry run: would review {repository}#{} with {} changed file(s)",
+                pull.number,
+                files.len()
             );
+            continue;
         }
 
-        let action = match positional.remove(0).as_str() {
-            "get" => DefaultsAction::Get(positional.first().cloned()),
-            "set" => {
-                if positional.len() < 2 {
-                    return Err("usage: valkyrie defaults set <key> <value>".to_string());
-                }
-                let key = positional.remove(0);
-                DefaultsAction::Set(key, positional.join(" "))
-            }
-            "unset" => {
-                let Some(key) = positional.first() else {
-                    return Err("usage: valkyrie defaults unset <key>".to_string());
-                };
-                DefaultsAction::Unset(key.clone())
-            }
-            "export" => DefaultsAction::Export,
-            other => return Err(format!("unknown defaults action `{other}`")),
+        println!("reviewing {repository}#{} with Anvil", pull.number);
+        let anvil = AnvilOptions {
+            binary: args.anvil_binary.clone(),
+            default_model: args.default_model.clone(),
+            max_turns: args.max_turns,
         };
+        let generated = anvil_review(&anvil, &prompt)?;
+        let review = sanitize_generated_review(generated, &files)?;
+        let posted = github.post_review(repository, &pull, &review, &marker)?;
+        state.record(repository, &pull, posted.id);
+        state.save(state_path)?;
+        println!("posted review for {repository}#{}", pull.number);
+    }
+    Ok(())
+}
 
-        Ok(Self {
-            scope,
-            repo,
-            action,
-        })
+fn run_doctor() -> Result<(), String> {
+    println!("gh: {}", command_status("gh"));
+    println!("anvil: {}", command_status("anvil"));
+    println!("github api: {}", github_api_status());
+    Ok(())
+}
+
+fn command_status(binary: &str) -> &'static str {
+    match Command::new(binary)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => "ok",
+        _ => "missing",
     }
 }
 
-#[derive(Default)]
-struct DefaultsStore {
-    values: BTreeMap<String, String>,
+fn github_api_status() -> &'static str {
+    match Command::new("gh")
+        .args(["api", "/user", "--method", "GET"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => "ok",
+        _ => "unavailable",
+    }
 }
 
-impl DefaultsStore {
+#[derive(Debug, Deserialize)]
+struct GitHubUser {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequest {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    user: GitHubUser,
+    head: PullRequestHead,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHead {
+    sha: String,
+    #[serde(rename = "ref")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReview {
+    user: GitHubUser,
+    body: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostedReview {
+    id: Option<u64>,
+}
+
+struct GitHubClient {}
+
+impl GitHubClient {
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn current_user(&self) -> Result<GitHubUser, String> {
+        self.get("/user")
+    }
+
+    fn open_pull_requests(
+        &self,
+        repository: &RepoSlug,
+        limit: u8,
+    ) -> Result<Vec<PullRequest>, String> {
+        let endpoint = format!(
+            "/repos/{}/{}/pulls?state=open&sort=created&direction=asc&per_page={}",
+            repository.owner, repository.name, limit
+        );
+        self.get(&endpoint)
+    }
+
+    fn pull_request_files(
+        &self,
+        repository: &RepoSlug,
+        number: u64,
+    ) -> Result<Vec<PullRequestFile>, String> {
+        let endpoint = format!(
+            "/repos/{}/{}/pulls/{number}/files?per_page=100",
+            repository.owner, repository.name
+        );
+        self.get(&endpoint)
+    }
+
+    fn review_already_posted(
+        &self,
+        repository: &RepoSlug,
+        number: u64,
+        viewer_login: &str,
+        marker: &str,
+    ) -> Result<bool, String> {
+        let endpoint = format!(
+            "/repos/{}/{}/pulls/{number}/reviews?per_page=100",
+            repository.owner, repository.name
+        );
+        let reviews: Vec<PullRequestReview> = self.get(&endpoint)?;
+        Ok(reviews.iter().any(|review| {
+            review.user.login == viewer_login
+                && review
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains(marker))
+        }))
+    }
+
+    fn post_review(
+        &self,
+        repository: &RepoSlug,
+        pull: &PullRequest,
+        review: &GeneratedReview,
+        marker: &str,
+    ) -> Result<PostedReview, String> {
+        let comments = review
+            .comments
+            .iter()
+            .filter_map(|comment| {
+                comment.line.map(|line| {
+                    json!({
+                        "path": comment.path,
+                        "line": line,
+                        "side": "RIGHT",
+                        "body": comment.body,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = format!("{}\n\n{}", review.summary.trim(), marker);
+        let payload = json!({
+            "commit_id": pull.head.sha,
+            "body": body,
+            "event": "COMMENT",
+            "comments": comments,
+        });
+        let endpoint = format!(
+            "/repos/{}/{}/pulls/{}/reviews",
+            repository.owner, repository.name, pull.number
+        );
+        self.post(&endpoint, payload)
+    }
+
+    fn get<T: for<'de> Deserialize<'de>>(&self, endpoint: &str) -> Result<T, String> {
+        let output = Command::new("gh")
+            .args(["api", endpoint, "--method", "GET"])
+            .output()
+            .map_err(|error| format!("cannot run `gh api`: {error}"))?;
+        decode_gh_output(output, endpoint)
+    }
+
+    fn post<T: for<'de> Deserialize<'de>>(
+        &self,
+        endpoint: &str,
+        payload: Value,
+    ) -> Result<T, String> {
+        let mut child = Command::new("gh")
+            .args(["api", endpoint, "--method", "POST", "--input", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run `gh api`: {error}"))?;
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "cannot open `gh api` stdin".to_string())?;
+            serde_json::to_writer(stdin, &payload)
+                .map_err(|error| format!("cannot write GitHub API payload: {error}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("cannot read `gh api` output: {error}"))?;
+        decode_gh_output(output, endpoint)
+    }
+}
+
+fn decode_gh_output<T: for<'de> Deserialize<'de>>(
+    output: std::process::Output,
+    endpoint: &str,
+) -> Result<T, String> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("`gh api {endpoint}` failed: {}", stderr.trim()));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cannot decode `gh api {endpoint}` response: {error}"))
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ReviewState {
+    reviews: BTreeMap<String, RecordedReview>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecordedReview {
+    repo: String,
+    pull_number: u64,
+    head_sha: String,
+    github_review_id: Option<u64>,
+    posted_at_unix: u64,
+}
+
+impl ReviewState {
     fn load(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Ok(Self::default());
         }
-
-        let content = fs::read_to_string(path)
+        let contents = fs::read_to_string(path)
             .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
-        let mut values = BTreeMap::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                values.insert(key.trim().to_string(), value.trim().to_string());
-            }
-        }
-        Ok(Self { values })
+        serde_json::from_str(&contents)
+            .map_err(|error| format!("cannot parse `{}`: {error}", path.display()))
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
-                .map_err(|error| format!("cannot create `{}`: {error}", dir.display()))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
         }
-        let mut content = String::from(
-            "# Generated by `valkyrie defaults set`. Prefer CLI commands over hand editing.\n",
-        );
-        for (key, value) in &self.values {
-            content.push_str(key);
-            content.push('=');
-            content.push_str(value);
-            content.push('\n');
-        }
-        write_text(path.to_path_buf(), &content)
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|error| format!("cannot encode review state: {error}"))?;
+        fs::write(path, format!("{contents}\n"))
+            .map_err(|error| format!("cannot write `{}`: {error}", path.display()))
     }
 
-    fn to_yaml(&self, scope: DefaultsScope) -> String {
-        let mut yaml = format!(
-            "# Generated by `valkyrie defaults export --{}`.\n# Prefer `valkyrie defaults set <key> <value>` over hand-editing.\n",
-            match scope {
-                DefaultsScope::Repo => "repo",
-                DefaultsScope::User => "global",
+    fn record(&mut self, repository: &RepoSlug, pull: &PullRequest, github_review_id: Option<u64>) {
+        let key = review_state_key(repository, pull.number);
+        self.reviews.insert(
+            key,
+            RecordedReview {
+                repo: repository.as_path(),
+                pull_number: pull.number,
+                head_sha: pull.head.sha.clone(),
+                github_review_id,
+                posted_at_unix: now_unix_seconds(),
+            },
+        );
+    }
+}
+
+fn review_state_key(repository: &RepoSlug, number: u64) -> String {
+    format!("{}#{}", repository.as_path(), number)
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GeneratedReview {
+    summary: String,
+    #[serde(default)]
+    comments: Vec<GeneratedComment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GeneratedComment {
+    path: String,
+    line: Option<u64>,
+    body: String,
+}
+
+fn sanitize_generated_review(
+    mut review: GeneratedReview,
+    files: &[PullRequestFile],
+) -> Result<GeneratedReview, String> {
+    review.summary = review.summary.trim().to_string();
+    if review.summary.is_empty() {
+        return Err("Anvil returned an empty pull request review summary".to_string());
+    }
+
+    let valid_paths = files
+        .iter()
+        .map(|file| file.filename.as_str())
+        .collect::<BTreeSet<_>>();
+    review.comments = review
+        .comments
+        .into_iter()
+        .filter_map(|mut comment| {
+            comment.path = comment.path.trim().to_string();
+            comment.body = comment.body.trim().to_string();
+            if comment.body.is_empty() || !valid_paths.contains(comment.path.as_str()) {
+                return None;
             }
-        );
-        for (key, value) in &self.values {
-            yaml.push_str(&format!("{}: {}\n", key.replace('.', ":\n  "), value));
-        }
-        yaml
+            Some(comment)
+        })
+        .collect();
+    Ok(review)
+}
+
+fn build_review_prompt(
+    repository: &RepoSlug,
+    pull: &PullRequest,
+    files: &[PullRequestFile],
+) -> String {
+    let mut prompt = format!(
+        "You are Valkyrie, a GitHub pull request reviewer.\n\
+         Review the pull request below and return a concise review summary plus actionable line comments.\n\
+         Only comment on real defects, regressions, security issues, missing tests, or maintainability problems.\n\
+         Do not comment on style preferences unless they hide a real risk.\n\n\
+         Repository: {repository}\n\
+         Pull request: #{}\n\
+         URL: {}\n\
+         Title: {}\n\
+         Author: {}\n\
+         Head branch: {}\n\
+         Head sha: {}\n\n\
+         Description:\n{}\n\n\
+         Changed files:\n",
+        pull.number,
+        pull.html_url,
+        pull.title,
+        pull.user.login,
+        pull.head.branch,
+        pull.head.sha,
+        pull.body.as_deref().unwrap_or("")
+    );
+
+    for file in files {
+        prompt.push_str(&format!(
+            "\n---\nPath: {}\nStatus: {}\nAdditions: {}\nDeletions: {}\nPatch:\n{}\n",
+            file.filename,
+            file.status,
+            file.additions,
+            file.deletions,
+            truncate_patch(file.patch.as_deref().unwrap_or(""))
+        ));
+    }
+    prompt
+}
+
+fn truncate_patch(patch: &str) -> String {
+    const LIMIT: usize = 12_000;
+    if patch.len() <= LIMIT {
+        return patch.to_string();
+    }
+    let mut truncated = patch[..LIMIT].to_string();
+    truncated.push_str("\n[patch truncated]\n");
+    truncated
+}
+
+struct AnvilOptions {
+    binary: String,
+    default_model: Option<String>,
+    max_turns: u16,
+}
+
+fn anvil_review(options: &AnvilOptions, prompt: &str) -> Result<GeneratedReview, String> {
+    let cwd =
+        std::env::current_dir().map_err(|error| format!("cannot read current dir: {error}"))?;
+    let mut client = AcpClient::start(options)?;
+    client.initialize()?;
+    let session_id = client.new_session(&cwd)?;
+    client.set_config(&session_id, "permission_mode", "readOnly")?;
+    let value = client.prompt(&session_id, prompt)?;
+    let output = extract_structured_output(&value)?;
+    serde_json::from_value(output)
+        .map_err(|error| format!("Anvil returned invalid review JSON: {error}"))
+}
+
+fn extract_structured_output(response: &Value) -> Result<Value, String> {
+    let structured = response
+        .pointer("/_meta/anvil/structuredOutput")
+        .ok_or_else(|| "Anvil response did not include structured output".to_string())?;
+    let status = structured
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Anvil structured output did not include a status".to_string())?;
+    match status {
+        "success" | "coerced_success" => structured
+            .get("validated_output")
+            .cloned()
+            .ok_or_else(|| "Anvil structured output did not include validated_output".to_string()),
+        "validation_error" => Err(format!(
+            "Anvil could not validate review output: {}",
+            structured
+                .get("invalid_excerpt")
+                .and_then(Value::as_str)
+                .unwrap_or("no excerpt")
+        )),
+        other => Err(format!(
+            "Anvil returned unknown structured output status `{other}`"
+        )),
     }
 }
 
-struct DefaultsResolver {
-    repo: DefaultsStore,
-    user: DefaultsStore,
+struct AcpClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
 }
 
-impl DefaultsResolver {
-    fn load(repo: &Path) -> Result<Self, String> {
+impl AcpClient {
+    fn start(options: &AnvilOptions) -> Result<Self, String> {
+        let mut command = Command::new(&options.binary);
+        command
+            .arg("--max-turns")
+            .arg(options.max_turns.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if let Some(default_model) = options.default_model.as_deref() {
+            command.arg("--default-model").arg(default_model);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start Anvil `{}`: {error}", options.binary))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "cannot open Anvil stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "cannot open Anvil stdout".to_string())?;
         Ok(Self {
-            repo: DefaultsStore::load(&defaults_path(repo, DefaultsScope::Repo)?)?,
-            user: DefaultsStore::load(&defaults_path(repo, DefaultsScope::User)?)?,
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 0,
         })
     }
 
-    fn get(&self, key: &str) -> Option<Resolved<String>> {
-        env_key_for_default(key)
-            .and_then(|env_key| {
-                env::var(env_key)
-                    .ok()
-                    .map(|value| Resolved::new(value, "env"))
-            })
-            .or_else(|| {
-                self.repo
-                    .values
-                    .get(key)
-                    .cloned()
-                    .map(|value| Resolved::new(value, "repo default"))
-            })
-            .or_else(|| {
-                self.user
-                    .values
-                    .get(key)
-                    .cloned()
-                    .map(|value| Resolved::new(value, "user default"))
-            })
-    }
-
-    fn bool(&self, key: &str) -> Option<Resolved<bool>> {
-        self.get(key).and_then(|resolved| {
-            parse_bool(&resolved.value).map(|value| resolved.with_value(value))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct Resolved<T> {
-    value: T,
-    source: String,
-}
-
-impl<T> Resolved<T> {
-    fn new(value: T, source: impl Into<String>) -> Self {
-        Self {
-            value,
-            source: source.into(),
-        }
-    }
-
-    fn with_value<U>(self, value: U) -> Resolved<U> {
-        Resolved {
-            value,
-            source: self.source,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriteMode {
-    NoWrite,
-    LocalPatch,
-    Commit,
-    Push,
-    Pr,
-}
-
-impl WriteMode {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::NoWrite => "no-write",
-            Self::LocalPatch => "local-patch",
-            Self::Commit => "commit",
-            Self::Push => "push",
-            Self::Pr => "pr",
-        }
-    }
-}
-
-struct EffectiveSettings {
-    validation: Vec<Resolved<String>>,
-    skip_validation: Resolved<bool>,
-    write_mode: WriteMode,
-    write_mode_source: String,
-    commit: Resolved<bool>,
-    push: Resolved<bool>,
-    open_pr: Resolved<bool>,
-    post_comment: Resolved<bool>,
-    verbose: bool,
-}
-
-impl EffectiveSettings {
-    fn from_inputs(parsed: &ParsedRun, defaults: &DefaultsResolver) -> Self {
-        let skip_validation = if parsed.skip_validation {
-            Resolved::new(true, "cli")
-        } else {
-            defaults
-                .bool("validation.skip")
-                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
-        };
-
-        let mut validation = Vec::new();
-        if !skip_validation.value {
-            for command in &parsed.validations {
-                validation.push(Resolved::new(command.clone(), "cli"));
+    fn initialize(&mut self) -> Result<(), String> {
+        let params = json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": true, "writeTextFile": false },
+                "terminal": false
+            },
+            "clientInfo": {
+                "name": "valkyrie",
+                "title": "Valkyrie",
+                "version": env!("CARGO_PKG_VERSION")
             }
-            if validation.is_empty()
-                && let Some(command) = defaults.get("validation.command")
-            {
-                validation.push(command);
-            }
-            if validation.is_empty() {
-                validation.push(Resolved::new(infer_validation_command(), "inferred"));
-            }
-        }
-
-        let commit = if parsed.commit {
-            Resolved::new(true, "cli")
-        } else {
-            defaults
-                .bool("write.commit")
-                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
-        };
-        let push = if parsed.push {
-            Resolved::new(true, "cli")
-        } else {
-            defaults
-                .bool("write.push")
-                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
-        };
-        let open_pr = if parsed.open_pr {
-            Resolved::new(true, "cli")
-        } else {
-            defaults
-                .bool("write.open_pr")
-                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
-        };
-        let post_comment = if parsed.post_comment {
-            Resolved::new(true, "cli")
-        } else {
-            defaults
-                .bool("write.post_comment")
-                .unwrap_or_else(|| Resolved::new(false, "built-in default"))
-        };
-
-        let (write_mode, write_mode_source) = if parsed.no_write || parsed.dry_run {
-            (WriteMode::NoWrite, "cli".to_string())
-        } else if open_pr.value {
-            (WriteMode::Pr, open_pr.source.clone())
-        } else if push.value {
-            (WriteMode::Push, push.source.clone())
-        } else if commit.value {
-            (WriteMode::Commit, commit.source.clone())
-        } else if parsed.write {
-            (WriteMode::LocalPatch, "cli".to_string())
-        } else {
-            (WriteMode::LocalPatch, "built-in default".to_string())
-        };
-
-        Self {
-            validation,
-            skip_validation,
-            write_mode,
-            write_mode_source,
-            commit,
-            push,
-            open_pr,
-            post_comment,
-            verbose: parsed.verbose,
-        }
+        });
+        self.request("initialize", params).map(|_| ())
     }
 
-    fn to_json(&self) -> String {
-        let validation = self
-            .validation
-            .iter()
-            .map(|resolved| {
-                format!(
-                    "    {{ \"command\": \"{}\", \"source\": \"{}\" }}",
-                    escape_json(&resolved.value),
-                    escape_json(&resolved.source)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",\n");
-        format!(
-            r#"{{
-  "write_mode": {{ "value": "{}", "source": "{}" }},
-  "validation": [
-{}
-  ],
-  "skip_validation": {{ "value": {}, "source": "{}" }},
-  "commit": {{ "value": {}, "source": "{}" }},
-  "push": {{ "value": {}, "source": "{}" }},
-  "open_pr": {{ "value": {}, "source": "{}" }},
-  "post_comment": {{ "value": {}, "source": "{}" }},
-  "verbose": {}
-}}
-"#,
-            self.write_mode.as_str(),
-            escape_json(&self.write_mode_source),
-            validation,
-            self.skip_validation.value,
-            escape_json(&self.skip_validation.source),
-            self.commit.value,
-            escape_json(&self.commit.source),
-            self.push.value,
-            escape_json(&self.push.source),
-            self.open_pr.value,
-            escape_json(&self.open_pr.source),
-            self.post_comment.value,
-            escape_json(&self.post_comment.source),
-            self.verbose,
+    fn new_session(&mut self, cwd: &Path) -> Result<String, String> {
+        let result = self.request(
+            "session/new",
+            json!({
+                "cwd": cwd.to_string_lossy(),
+                "mcpServers": []
+            }),
+        )?;
+        result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "Anvil session/new response did not include sessionId".to_string())
+    }
+
+    fn set_config(&mut self, session_id: &str, config_id: &str, value: &str) -> Result<(), String> {
+        self.request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": config_id,
+                "value": value
+            }),
+        )
+        .map(|_| ())
+    }
+
+    fn prompt(&mut self, session_id: &str, prompt: &str) -> Result<Value, String> {
+        self.request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": prompt }],
+                "_meta": {
+                    "anvil": {
+                        "structuredOutput": {
+                            "schemaName": "valkyrie_pr_review",
+                            "allowCoercion": true,
+                            "schema": review_schema()
+                        }
+                    }
+                }
+            }),
         )
     }
 
-    fn render_human(&self) -> String {
-        let mut output = String::from("Effective settings:\n\nValidation commands:\n");
-        if self.skip_validation.value {
-            output.push_str(&format!(
-                "  skipped    from {}\n",
-                self.skip_validation.source
-            ));
-        } else {
-            for command in &self.validation {
-                output.push_str(&format!("  {}    from {}\n", command.value, command.source));
-            }
-        }
-        output.push_str("\nWrite policy:\n");
-        output.push_str(&format!(
-            "  mode: {}    from {}\n",
-            self.write_mode.as_str(),
-            self.write_mode_source
-        ));
-        output.push_str(&format!(
-            "  commit: {}    from {}\n",
-            self.commit.value, self.commit.source
-        ));
-        output.push_str(&format!(
-            "  push: {}    from {}\n",
-            self.push.value, self.push.source
-        ));
-        output.push_str(&format!(
-            "  open_pr: {}    from {}\n",
-            self.open_pr.value, self.open_pr.source
-        ));
-        output.push_str(&format!(
-            "  post_comment: {}    from {}",
-            self.post_comment.value, self.post_comment.source
-        ));
-        output
-    }
-}
-
-struct ValidationReport {
-    skipped: bool,
-    results: Vec<ValidationCommandResult>,
-}
-
-impl ValidationReport {
-    fn skipped() -> Self {
-        Self {
-            skipped: true,
-            results: Vec::new(),
-        }
-    }
-
-    fn failed(&self) -> bool {
-        self.results.iter().any(|result| !result.success)
-    }
-
-    fn to_markdown(&self) -> String {
-        if self.skipped {
-            return "# Validation\n\nValidation was skipped by settings.\n".to_string();
-        }
-
-        let mut markdown = String::from("# Validation\n\n");
-        if self.results.is_empty() {
-            markdown.push_str("No validation commands were configured.\n");
-            return markdown;
-        }
-
-        for result in &self.results {
-            markdown.push_str(&format!(
-                "## `{}`\n\n- Source: {}\n- Exit code: {}\n- Status: {}\n\n",
-                result.command,
-                result.source,
-                result
-                    .exit_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "terminated by signal".to_string()),
-                if result.success { "passed" } else { "failed" }
-            ));
-            markdown.push_str("### stdout\n\n```text\n");
-            markdown.push_str(&result.stdout);
-            if !result.stdout.ends_with('\n') {
-                markdown.push('\n');
-            }
-            markdown.push_str("```\n\n### stderr\n\n```text\n");
-            markdown.push_str(&result.stderr);
-            if !result.stderr.ends_with('\n') {
-                markdown.push('\n');
-            }
-            markdown.push_str("```\n\n");
-        }
-        markdown
-    }
-}
-
-struct ValidationCommandResult {
-    command: String,
-    source: String,
-    success: bool,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_validation(repo: &Path, settings: &EffectiveSettings) -> Result<ValidationReport, String> {
-    if settings.skip_validation.value {
-        return Ok(ValidationReport::skipped());
-    }
-
-    let mut results = Vec::new();
-    for command in &settings.validation {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command.value)
-            .current_dir(repo)
-            .output()
-            .map_err(|error| format!("cannot run validation `{}`: {error}", command.value))?;
-        results.push(ValidationCommandResult {
-            command: command.value.clone(),
-            source: command.source.clone(),
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
         });
+        writeln!(self.stdin, "{request}")
+            .map_err(|error| format!("cannot write ACP request `{method}`: {error}"))?;
+        self.stdin
+            .flush()
+            .map_err(|error| format!("cannot flush ACP request `{method}`: {error}"))?;
+        self.read_response(id)
     }
 
-    Ok(ValidationReport {
-        skipped: false,
-        results,
+    fn read_response(&mut self, id: u64) -> Result<Value, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = self
+                .stdout
+                .read_line(&mut line)
+                .map_err(|error| format!("cannot read Anvil response: {error}"))?;
+            if bytes == 0 {
+                return Err("Anvil exited before returning an ACP response".to_string());
+            }
+            let message: Value = serde_json::from_str(line.trim())
+                .map_err(|error| format!("Anvil returned invalid JSON-RPC: {error}: {line}"))?;
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(format!("Anvil ACP request failed: {error}"));
+            }
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| "Anvil ACP response did not include result".to_string());
+        }
+    }
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn review_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "comments"],
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "A concise pull request review summary in Markdown."
+            },
+            "comments": {
+                "type": "array",
+                "description": "Actionable inline review comments. Use an empty array if there are no inline findings.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "line", "body"],
+                    "properties": {
+                        "path": { "type": "string" },
+                        "line": { "type": ["integer", "null"], "minimum": 1 },
+                        "body": { "type": "string" }
+                    }
+                }
+            }
+        }
     })
-}
-
-struct TargetContext {
-    problem_statement: String,
-    summary: String,
-    metadata_json: Option<String>,
-    warning: Option<String>,
-}
-
-impl TargetContext {
-    fn to_markdown(&self) -> String {
-        let mut markdown = format!(
-            "# Target Context\n\n## Problem statement\n\n{}\n\n## Summary\n\n{}\n",
-            self.problem_statement, self.summary
-        );
-        if let Some(warning) = &self.warning {
-            markdown.push_str("\n## Warning\n\n");
-            markdown.push_str(warning);
-            markdown.push('\n');
-        }
-        if self.metadata_json.is_some() {
-            markdown.push_str("\nRaw target metadata was captured in the run directory.\n");
-        }
-        markdown
-    }
-}
-
-fn resolve_target_context(target: &Target, repo: &Path) -> TargetContext {
-    match target {
-        Target::LocalTask(task) => TargetContext {
-            problem_statement: task.clone(),
-            summary: "Local repository task provided directly on the CLI.".to_string(),
-            metadata_json: None,
-            warning: None,
-        },
-        Target::Issue(number) => resolve_issue_context(number, repo),
-        Target::PullRequest(number) => resolve_pr_context(number, repo),
-    }
-}
-
-fn resolve_issue_context(number: &str, repo: &Path) -> TargetContext {
-    match gh_issue_view(number, repo) {
-        Ok(json) => {
-            let title =
-                json_string_field(&json, "title").unwrap_or_else(|| format!("Issue #{number}"));
-            let url = json_string_field(&json, "url");
-            let state = json_string_field(&json, "state");
-            let mut summary = format!("GitHub issue #{number}: {title}");
-            if let Some(state) = state {
-                summary.push_str(&format!("\n- State: {state}"));
-            }
-            if let Some(url) = url {
-                summary.push_str(&format!("\n- URL: {url}"));
-            }
-            summary.push_str("\n- Metadata source: `gh issue view`.");
-
-            TargetContext {
-                problem_statement: format!("Fix GitHub issue #{number}: {title}"),
-                summary,
-                metadata_json: Some(json),
-                warning: None,
-            }
-        }
-        Err(error) => TargetContext {
-            problem_statement: format!("Fix GitHub issue #{number}"),
-            summary: format!(
-                "GitHub issue #{number} was selected, but metadata could not be fetched."
-            ),
-            metadata_json: None,
-            warning: Some(format!(
-                "Install/authenticate the GitHub CLI (`gh`) or run in a GitHub-aware environment to fetch issue details. Fetch error: {error}"
-            )),
-        },
-    }
-}
-
-fn resolve_pr_context(number: &str, repo: &Path) -> TargetContext {
-    match gh_pr_view(number, repo) {
-        Ok(json) => {
-            let title =
-                json_string_field(&json, "title").unwrap_or_else(|| format!("PR #{number}"));
-            let url = json_string_field(&json, "url");
-            let state = json_string_field(&json, "state");
-            let mut summary = format!("GitHub PR #{number}: {title}");
-            if let Some(state) = state {
-                summary.push_str(&format!("\n- State: {state}"));
-            }
-            if let Some(url) = url {
-                summary.push_str(&format!("\n- URL: {url}"));
-            }
-            summary.push_str("\n- Metadata source: `gh pr view`.");
-
-            TargetContext {
-                problem_statement: format!("Fix GitHub PR #{number}: {title}"),
-                summary,
-                metadata_json: Some(json),
-                warning: None,
-            }
-        }
-        Err(error) => TargetContext {
-            problem_statement: format!("Fix GitHub PR #{number}"),
-            summary: format!(
-                "GitHub PR #{number} was selected, but metadata could not be fetched."
-            ),
-            metadata_json: None,
-            warning: Some(format!(
-                "Install/authenticate the GitHub CLI (`gh`) or run in a GitHub-aware environment to fetch PR details. Fetch error: {error}"
-            )),
-        },
-    }
-}
-
-fn gh_issue_view(number: &str, repo: &Path) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args([
-            "issue",
-            "view",
-            number,
-            "--json",
-            "title,body,labels,comments,url,state,author",
-        ])
-        .current_dir(repo)
-        .output()
-        .map_err(|error| format!("cannot run gh: {error}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-const GH_PR_VIEW_JSON_FIELDS: &str =
-    "title,body,comments,reviews,url,state,author,headRefName,baseRefName";
-
-fn gh_pr_view(number: &str, repo: &Path) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args(["pr", "view", number, "--json", GH_PR_VIEW_JSON_FIELDS])
-        .current_dir(repo)
-        .output()
-        .map_err(|error| format!("cannot run gh: {error}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-fn json_string_field(json: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = json.find(&needle)? + needle.len();
-    let mut escaped = false;
-    let mut value = String::new();
-    for char in json[start..].chars() {
-        if escaped {
-            value.push(match char {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\\' => '\\',
-                '"' => '"',
-                other => other,
-            });
-            escaped = false;
-        } else if char == '\\' {
-            escaped = true;
-        } else if char == '"' {
-            return Some(value);
-        } else {
-            value.push(char);
-        }
-    }
-    None
-}
-
-fn render_plan(
-    _parsed: &ParsedRun,
-    settings: &EffectiveSettings,
-    target_context: &TargetContext,
-    plan_only: bool,
-) -> String {
-    let validation = settings
-        .validation
-        .iter()
-        .map(|resolved| format!("- `{}` ({})", resolved.value, resolved.source))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Target context\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
-        target_context.problem_statement,
-        target_context.summary,
-        validation,
-        settings.write_mode.as_str(),
-        settings.write_mode_source,
-        if plan_only { " (planning only)" } else { "" }
-    )
-}
-
-fn render_target_json(target: &Target, repo: &Path) -> String {
-    match target {
-        Target::LocalTask(task) => format!(
-            "{{\n  \"kind\": \"{}\",\n  \"task\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
-            target.kind(),
-            escape_json(task),
-            escape_json(&repo.display().to_string())
-        ),
-        Target::Issue(number) => format!(
-            "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
-            target.kind(),
-            escape_json(number),
-            escape_json(&repo.display().to_string())
-        ),
-        Target::PullRequest(number) => format!(
-            "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
-            target.kind(),
-            escape_json(number),
-            escape_json(&repo.display().to_string())
-        ),
-    }
-}
-
-fn render_created_json(run_id: &str, run_dir: &Path, plan_only: bool) -> String {
-    format!(
-        "{{\n  \"run_id\": \"{}\",\n  \"run_dir\": \"{}\",\n  \"state\": \"{}\"\n}}",
-        escape_json(run_id),
-        escape_json(&run_dir.display().to_string()),
-        if plan_only { "planned" } else { "created" }
-    )
-}
-
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    iter.next()
-        .ok_or_else(|| format!("missing value after `{flag}`"))
-}
-
-fn make_run_id(slug: &str) -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if slug.is_empty() {
-        format!("{seconds}-run")
-    } else {
-        format!("{seconds}-{slug}")
-    }
-}
-
-fn slugify(input: &str) -> String {
-    input
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() {
-                char.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .chars()
-        .take(40)
-        .collect()
-}
-
-fn current_repo() -> Result<PathBuf, String> {
-    env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))
-}
-
-fn resolve_repo(path: &Path) -> Result<PathBuf, String> {
-    let repo = path
-        .canonicalize()
-        .map_err(|error| format!("cannot resolve repo path `{}`: {error}", path.display()))?;
-
-    if !repo.join(".git").exists() {
-        return Err(format!(
-            "`{}` does not look like a git repository",
-            repo.display()
-        ));
-    }
-
-    Ok(repo)
-}
-
-fn defaults_path(repo: &Path, scope: DefaultsScope) -> Result<PathBuf, String> {
-    match scope {
-        DefaultsScope::Repo => Ok(repo.join(".valkyrie").join("defaults.env")),
-        DefaultsScope::User => Ok(user_defaults_path()?),
-    }
-}
-
-fn user_defaults_path() -> Result<PathBuf, String> {
-    if let Ok(path) = env::var("VALKYRIE_DEFAULTS_PATH") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = env::var("HOME").map_err(|_| {
-        "cannot resolve user defaults path: HOME is not set and VALKYRIE_DEFAULTS_PATH was not provided"
-            .to_string()
-    })?;
-    Ok(PathBuf::from(home).join(".config/valkyrie/defaults.env"))
-}
-
-fn resolve_run_dir(repo: &Path, run_id: &str) -> Result<PathBuf, String> {
-    let runs = repo.join(".valkyrie").join("runs");
-    if run_id == "latest" {
-        let mut entries = fs::read_dir(&runs)
-            .map_err(|error| format!("cannot read runs directory `{}`: {error}", runs.display()))?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().is_dir())
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        return entries
-            .last()
-            .map(|entry| entry.path())
-            .ok_or_else(|| "no runs found".to_string());
-    }
-    Ok(runs.join(run_id))
-}
-
-fn artifact_command_name(artifact: &str) -> &str {
-    match artifact {
-        "result.json" => "status",
-        "events.jsonl" => "logs",
-        "diff.patch" => "diff",
-        _ => "show",
-    }
-}
-
-fn git_output(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .map_err(|error| format!("cannot run git: {error}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
-}
-
-fn command_exists(command: &str) -> bool {
-    Command::new(command)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn write_text(path: PathBuf, content: &str) -> Result<(), String> {
-    fs::write(&path, content).map_err(|error| format!("cannot write `{}`: {error}", path.display()))
-}
-
-fn escape_json(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn env_key_for_default(key: &str) -> Option<&'static str> {
-    match key {
-        "validation.command" => Some("VALKYRIE_VALIDATION_COMMAND"),
-        "validation.skip" => Some("VALKYRIE_SKIP_VALIDATION"),
-        "write.commit" => Some("VALKYRIE_WRITE_COMMIT"),
-        "write.push" => Some("VALKYRIE_WRITE_PUSH"),
-        "write.open_pr" => Some("VALKYRIE_WRITE_OPEN_PR"),
-        "write.post_comment" => Some("VALKYRIE_WRITE_POST_COMMENT"),
-        _ => None,
-    }
-}
-
-fn infer_validation_command() -> String {
-    if Path::new("Cargo.toml").exists() {
-        "cargo test".to_string()
-    } else if Path::new("package.json").exists() {
-        "npm test".to_string()
-    } else {
-        "echo 'no validation command inferred'".to_string()
-    }
-}
-
-fn print_help() {
-    println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
-    );
 }
 
 #[cfg(test)]
@@ -1325,292 +848,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slugify_limits_and_normalizes() {
-        assert_eq!(slugify("Fix the Parser Panic!"), "fix-the-parser-panic");
-        assert_eq!(slugify("---"), "");
+    fn parses_repository_slug() {
+        let slug: RepoSlug = "BrokkAi/valkyrie".parse().expect("valid slug");
+        assert_eq!(slug.owner, "BrokkAi");
+        assert_eq!(slug.name, "valkyrie");
     }
 
     #[test]
-    fn target_parses_local_task_when_no_known_alias_is_present() {
-        let target = Target::from_parts(vec!["fix".to_string(), "parser".to_string()]);
-        assert_eq!(target.kind(), "local-task");
-        assert_eq!(target.slug(), "fix-parser");
+    fn rejects_invalid_repository_slug() {
+        assert!("BrokkAi".parse::<RepoSlug>().is_err());
+        assert!("BrokkAi/val kyrie".parse::<RepoSlug>().is_err());
     }
 
     #[test]
-    fn rewrite_target_alias_leaves_local_tasks_unchanged() {
-        let args = vec![
-            "fix".to_string(),
-            "parser".to_string(),
-            "--repo".to_string(),
-            ".".to_string(),
-        ];
-
-        assert_eq!(rewrite_target_alias(args.clone()), args);
+    fn merges_and_deduplicates_repositories() {
+        let one: RepoSlug = "BrokkAi/one".parse().expect("slug");
+        let two: RepoSlug = "BrokkAi/two".parse().expect("slug");
+        let merged = merge_repositories(vec![one.clone()], vec![one.clone(), two.clone()])
+            .expect("merged repositories");
+        assert_eq!(merged, vec![one, two]);
     }
 
     #[test]
-    fn target_parses_issue_alias() {
-        let target = Target::from_parts(vec!["issue".to_string(), "123".to_string()]);
-        assert_eq!(target.kind(), "github-issue");
-        assert_eq!(target.slug(), "issue-123");
+    fn builds_stable_review_state_key() {
+        let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
+        assert_eq!(review_state_key(&repo, 42), "BrokkAi/valkyrie#42");
     }
 
     #[test]
-    fn target_parses_pull_request_alias() {
-        let target = Target::from_parts(vec!["pr".to_string(), "456".to_string()]);
-        assert_eq!(target.kind(), "github-pr");
-        assert_eq!(target.slug(), "pr-456");
-    }
-
-    #[test]
-    fn rewrite_target_alias_preserves_pull_request_target() {
-        let rewritten = rewrite_target_alias(vec![
-            "pr".to_string(),
-            "456".to_string(),
-            "--repo".to_string(),
-            ".".to_string(),
-        ]);
-
-        assert_eq!(
-            rewritten,
-            vec![
-                "pr".to_string(),
-                "456".to_string(),
-                "--repo".to_string(),
-                ".".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn render_target_json_includes_pull_request_kind_and_number() {
-        let target = Target::PullRequest("456".to_string());
-        let json = render_target_json(&target, Path::new("/tmp/example"));
-
-        assert!(json.contains("\"kind\": \"github-pr\""));
-        assert!(json.contains("\"number\": \"456\""));
-        assert!(json.contains("\"repo\": \"/tmp/example\""));
-    }
-
-    #[test]
-    fn parsed_run_parse_captures_flags_and_pull_request_target() {
-        let parsed = ParsedRun::parse(
-            vec![
-                "pr".to_string(),
-                "456".to_string(),
-                "--repo".to_string(),
-                ".".to_string(),
-                "--validate".to_string(),
-                "cargo test".to_string(),
-                "--dry-run".to_string(),
-                "--commit".to_string(),
-                "--push".to_string(),
-                "--open-pr".to_string(),
-                "--post-comment".to_string(),
-                "--json".to_string(),
-                "--verbose".to_string(),
+    fn filters_invalid_generated_comments() {
+        let files = vec![PullRequestFile {
+            filename: "src/lib.rs".to_string(),
+            status: "modified".to_string(),
+            additions: 1,
+            deletions: 1,
+            patch: None,
+        }];
+        let review = GeneratedReview {
+            summary: "Looks good except one issue.".to_string(),
+            comments: vec![
+                GeneratedComment {
+                    path: "src/lib.rs".to_string(),
+                    line: Some(10),
+                    body: "Fix this.".to_string(),
+                },
+                GeneratedComment {
+                    path: "missing.rs".to_string(),
+                    line: Some(1),
+                    body: "Nope.".to_string(),
+                },
             ],
-            false,
-        )
-        .unwrap();
-
-        assert!(matches!(parsed.target, Target::PullRequest(ref number) if number == "456"));
-        assert_eq!(parsed.repo, PathBuf::from("."));
-        assert_eq!(parsed.validations, vec!["cargo test".to_string()]);
-        assert!(parsed.dry_run);
-        assert!(parsed.commit);
-        assert!(parsed.push);
-        assert!(parsed.open_pr);
-        assert!(parsed.post_comment);
-        assert!(parsed.json);
-        assert!(parsed.verbose);
+        };
+        let sanitized = sanitize_generated_review(review, &files).expect("sanitized review");
+        assert_eq!(sanitized.comments.len(), 1);
+        assert_eq!(sanitized.comments[0].path, "src/lib.rs");
     }
 
     #[test]
-    fn parsed_run_parse_rejects_missing_task_unknown_flag_and_missing_flag_value() {
-        assert!(ParsedRun::parse(Vec::new(), false).is_err());
-        assert!(
-            ParsedRun::parse(vec!["task".to_string(), "--unknown".to_string()], false).is_err()
-        );
-        assert!(ParsedRun::parse(vec!["task".to_string(), "--repo".to_string()], false).is_err());
-    }
-
-    #[test]
-    fn defaults_args_parse_set_global_and_errors() {
-        let parsed = DefaultsArgs::parse(vec![
-            "--global".to_string(),
-            "set".to_string(),
-            "validation.command".to_string(),
-            "cargo".to_string(),
-            "test".to_string(),
-        ])
-        .unwrap();
-
-        assert!(matches!(parsed.scope, DefaultsScope::User));
-        match parsed.action {
-            DefaultsAction::Set(key, value) => {
-                assert_eq!(key, "validation.command");
-                assert_eq!(value, "cargo test");
+    fn extracts_successful_structured_output() {
+        let value = json!({
+            "_meta": {
+                "anvil": {
+                    "structuredOutput": {
+                        "status": "success",
+                        "schema_name": "valkyrie_pr_review",
+                        "validated_output": {
+                            "summary": "Summary",
+                            "comments": []
+                        },
+                        "coercion_requested": false
+                    }
+                }
             }
-            _ => panic!("expected set action"),
-        }
-
-        assert!(DefaultsArgs::parse(Vec::new()).is_err());
-        assert!(DefaultsArgs::parse(vec!["set".to_string(), "only-key".to_string()]).is_err());
-        assert!(DefaultsArgs::parse(vec!["unset".to_string()]).is_err());
-        assert!(DefaultsArgs::parse(vec!["unknown".to_string()]).is_err());
-    }
-
-    #[test]
-    fn defaults_store_loads_env_file_and_exports_yaml() {
-        let path = env::temp_dir().join(format!("valkyrie-defaults-{}.env", make_run_id("test")));
-        fs::write(
-            &path,
-            "# comment\n\nvalidation.command = cargo test\nwrite.commit=true\nignored-without-equals\n",
-        )
-        .unwrap();
-
-        let store = DefaultsStore::load(&path).unwrap();
-        assert_eq!(
-            store.values.get("validation.command"),
-            Some(&"cargo test".to_string())
-        );
-        assert_eq!(store.values.get("write.commit"), Some(&"true".to_string()));
-        assert!(!store.values.contains_key("ignored-without-equals"));
-
-        let yaml = store.to_yaml(DefaultsScope::Repo);
-        assert!(yaml.contains("# Generated by `valkyrie defaults export --repo`."));
-        assert!(yaml.contains("validation:\n  command: cargo test"));
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn effective_settings_selects_write_modes_from_cli_flags() {
-        let defaults = DefaultsResolver {
-            repo: DefaultsStore::default(),
-            user: DefaultsStore::default(),
-        };
-
-        let mut parsed =
-            ParsedRun::parse(vec!["task".to_string(), "--no-write".to_string()], false).unwrap();
-        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-        assert_eq!(settings.write_mode, WriteMode::NoWrite);
-        assert_eq!(settings.write_mode_source, "cli");
-
-        parsed = ParsedRun::parse(vec!["task".to_string(), "--commit".to_string()], false).unwrap();
-        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-        assert_eq!(settings.write_mode, WriteMode::Commit);
-
-        parsed = ParsedRun::parse(vec!["task".to_string(), "--push".to_string()], false).unwrap();
-        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-        assert_eq!(settings.write_mode, WriteMode::Push);
-
-        parsed =
-            ParsedRun::parse(vec!["task".to_string(), "--open-pr".to_string()], false).unwrap();
-        let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
-        assert_eq!(settings.write_mode, WriteMode::Pr);
-    }
-
-    #[test]
-    fn target_context_markdown_includes_warning_and_generic_metadata_note() {
-        let context = TargetContext {
-            problem_statement: "Fix PR #456".to_string(),
-            summary: "PR context".to_string(),
-            metadata_json: Some("{}".to_string()),
-            warning: Some("gh is unavailable".to_string()),
-        };
-
-        let markdown = context.to_markdown();
-        assert!(markdown.contains("Fix PR #456"));
-        assert!(markdown.contains("gh is unavailable"));
-        assert!(markdown.contains("Raw target metadata was captured"));
-        assert!(!markdown.contains("issue.json"));
-    }
-
-    #[test]
-    fn gh_pr_view_fields_do_not_include_unsupported_review_threads() {
-        assert!(GH_PR_VIEW_JSON_FIELDS.contains("reviews"));
-        assert!(GH_PR_VIEW_JSON_FIELDS.contains("comments"));
-        assert!(!GH_PR_VIEW_JSON_FIELDS.contains("reviewThreads"));
-    }
-
-    #[test]
-    fn validation_report_markdown_covers_failed_command_without_newlines() {
-        let report = ValidationReport {
-            skipped: false,
-            results: vec![ValidationCommandResult {
-                command: "false".to_string(),
-                source: "cli".to_string(),
-                success: false,
-                exit_code: None,
-                stdout: "no-newline".to_string(),
-                stderr: "err".to_string(),
-            }],
-        };
-
-        assert!(report.failed());
-        let markdown = report.to_markdown();
-        assert!(markdown.contains("- Exit code: terminated by signal"));
-        assert!(markdown.contains("- Status: failed"));
-        assert!(markdown.contains("no-newline\n```"));
-        assert!(markdown.contains("err\n```"));
-    }
-
-    #[test]
-    fn render_created_json_uses_planned_or_created_state() {
-        let planned = render_created_json("run-1", Path::new("/tmp/run-1"), true);
-        let created = render_created_json("run-2", Path::new("/tmp/run-2"), false);
-
-        assert!(planned.contains("\"state\": \"planned\""));
-        assert!(created.contains("\"state\": \"created\""));
-    }
-
-    #[test]
-    fn bool_parser_accepts_common_values() {
-        assert_eq!(parse_bool("true"), Some(true));
-        assert_eq!(parse_bool("off"), Some(false));
-        assert_eq!(parse_bool("maybe"), None);
-    }
-
-    #[test]
-    fn extracts_simple_json_string_fields() {
-        let json =
-            r#"{"title":"Fix parser panic","state":"OPEN","url":"https://example.test/issue/1"}"#;
-        assert_eq!(
-            json_string_field(json, "title"),
-            Some("Fix parser panic".to_string())
-        );
-        assert_eq!(json_string_field(json, "state"), Some("OPEN".to_string()));
-        assert_eq!(json_string_field(json, "missing"), None);
-    }
-
-    #[test]
-    fn validation_report_markdown_includes_command_output() {
-        let report = ValidationReport {
-            skipped: false,
-            results: vec![ValidationCommandResult {
-                command: "cargo test".to_string(),
-                source: "cli".to_string(),
-                success: true,
-                exit_code: Some(0),
-                stdout: "ok\n".to_string(),
-                stderr: String::new(),
-            }],
-        };
-
-        let markdown = report.to_markdown();
-        assert!(markdown.contains("## `cargo test`"));
-        assert!(markdown.contains("- Source: cli"));
-        assert!(markdown.contains("- Status: passed"));
-        assert!(markdown.contains("ok"));
-    }
-
-    #[test]
-    fn skipped_validation_report_is_not_failed() {
-        let report = ValidationReport::skipped();
-        assert!(!report.failed());
-        assert!(report.to_markdown().contains("Validation was skipped"));
+        });
+        let output = extract_structured_output(&value).expect("structured output");
+        assert_eq!(output["summary"], "Summary");
     }
 }
