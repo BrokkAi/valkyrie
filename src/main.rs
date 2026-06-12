@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,7 +38,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command `{other}`. Run `valkyrie help` for usage."
+            "unknown command `{other}`. Run `vk help` for usage."
         )),
     }
 }
@@ -126,28 +127,74 @@ Planning completed. No files were modified by Valkyrie.
         return Ok(());
     }
 
+    if settings.write_mode.requires_clean_worktree() {
+        ensure_clean_worktree(&repo)?;
+    }
+
+    let status_before = git_output(&repo, &["status", "--porcelain"])?;
+    let diff_before = git_output(&repo, &["diff", "--"])?;
+    let agent = run_agent(&repo, &run_dir, &parsed, &settings, &target_context, &plan)?;
+    let status_after_agent = git_output(&repo, &["status", "--porcelain"])?;
     let diff = git_output(&repo, &["diff", "--"])?;
     write_text(run_dir.join("diff.patch"), &diff)?;
 
     let validation = run_validation(&repo, &settings)?;
     write_text(run_dir.join("validation.md"), &validation.to_markdown())?;
-    let state = if validation.failed() {
+    let changed = diff != diff_before || status_after_agent != status_before;
+
+    let write_actions = if agent.success && !validation.failed() {
+        run_write_actions(
+            &repo,
+            &run_dir,
+            &parsed,
+            &settings,
+            &target_context,
+            changed,
+            &validation,
+        )?
+    } else {
+        WriteActionReport::skipped("agent or validation failed before write actions")
+    };
+    write_text(
+        run_dir.join("write-actions.md"),
+        &write_actions.to_markdown(),
+    )?;
+
+    let state = if !agent.success || validation.failed() || write_actions.failed() {
         "failed"
+    } else if changed {
+        if write_actions.has_remote_effect() {
+            "published"
+        } else if write_actions.committed() {
+            "committed"
+        } else {
+            "changed"
+        }
     } else if validation.skipped {
-        "planned"
+        "completed"
     } else {
         "validated"
     };
 
+    let agent_state = if agent.invoked {
+        if agent.success { "completed" } else { "failed" }
+    } else {
+        "skipped"
+    };
     write_text(
         run_dir.join("summary.md"),
         &format!(
-            "# Summary
-
-Run record created. Agent execution is not wired yet; this MVP skeleton records the target, settings, plan, logs, current diff, and validation result.
-
-Validation state: `{state}`.
-"
+            "# Summary\n\nValkyrie created an inspectable run record and {}.\n\n- Agent: `{}`.\n- Files changed: {}.\n- Validation state: `{state}`.\n- Commit: {}.\n- Push: {}.\n- PR/comment: {}.\n\nSee `agent.md`, `diff.patch`, `validation.md`, and `write-actions.md` in this run directory for details.\n",
+            if agent.invoked {
+                "invoked the configured agent command"
+            } else {
+                "did not invoke an agent because no agent command was configured"
+            },
+            agent_state,
+            if changed { "yes" } else { "no" },
+            write_actions.commit_summary(),
+            write_actions.push_summary(),
+            write_actions.remote_summary(),
         ),
     )?;
     write_text(
@@ -157,17 +204,42 @@ Validation state: `{state}`.
   "run_id": "{}",
   "state": "{}",
   "run_dir": "{}",
-  "agent_invoked": false,
-  "validation": {{ "skipped": {}, "failed": {} }}
+  "agent_invoked": {},
+  "agent_success": {},
+  "changed": {},
+  "validation": {{ "skipped": {}, "failed": {} }},
+  "write_actions": {}
 }}
 "#,
             escape_json(&run_id),
             state,
             escape_json(&run_dir.display().to_string()),
+            agent.invoked,
+            agent.success,
+            changed,
             validation.skipped,
-            validation.failed()
+            validation.failed(),
+            write_actions.to_json()
         ),
     )?;
+
+    if !parsed.json {
+        println!();
+        println!("Run finished: {state}");
+        println!("Artifacts: {}", run_dir.display());
+        println!("Files changed: {}", if changed { "yes" } else { "no" });
+        println!("Commit: {}", write_actions.commit_summary());
+        println!("Push: {}", write_actions.push_summary());
+        println!("PR/comment: {}", write_actions.remote_summary());
+    }
+
+    if agent.invoked && !agent.success {
+        return Err(format!(
+            "agent command failed for run `{}`. See `{}`",
+            run_id,
+            run_dir.join("agent.md").display()
+        ));
+    }
 
     if validation.failed() {
         return Err(format!(
@@ -177,12 +249,20 @@ Validation state: `{state}`.
         ));
     }
 
+    if write_actions.failed() {
+        return Err(format!(
+            "write actions failed for run `{}`. See `{}`",
+            run_id,
+            run_dir.join("write-actions.md").display()
+        ));
+    }
+
     Ok(())
 }
 
 fn command_plan(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: valkyrie plan <task>|issue <number> [--repo <path>]".to_string());
+        return Err("usage: vk plan <task>|issue <number> [--repo <path>]".to_string());
     }
 
     command_run(rewrite_target_alias(args), true)
@@ -190,7 +270,7 @@ fn command_plan(args: Vec<String>) -> Result<(), String> {
 
 fn command_issue(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: valkyrie issue <number> [--repo <path>] [--plan]".to_string());
+        return Err("usage: vk issue <number> [--repo <path>] [--plan]".to_string());
     }
 
     let mut rewritten = vec!["issue".to_string(), args[0].clone()];
@@ -207,7 +287,7 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
 
 fn command_pr(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: valkyrie pr <number> [--repo <path>] [--fix] [--plan]".to_string());
+        return Err("usage: vk pr <number> [--repo <path>] [--fix] [--plan]".to_string());
     }
 
     let mut rewritten = vec!["pr".to_string(), args[0].clone()];
@@ -267,7 +347,7 @@ fn command_defaults(args: Vec<String>) -> Result<(), String> {
 fn command_show_artifact(args: Vec<String>, artifact: &str) -> Result<(), String> {
     let Some(run_id) = args.first() else {
         return Err(format!(
-            "usage: valkyrie {} <run-id|latest>",
+            "usage: vk {} <run-id|latest>",
             artifact_command_name(artifact)
         ));
     };
@@ -296,12 +376,10 @@ fn command_doctor() -> Result<(), String> {
     );
     println!("user defaults: {}", user_defaults_path()?.display());
     println!(
-        "anvil: {}",
-        if command_exists("anvil") {
-            "ok"
-        } else {
-            "missing"
-        }
+        "agent command: {}",
+        detect_agent_command()
+            .map(|command| format!("{} ({})", command.value, command.source))
+            .unwrap_or_else(|| "missing".to_string())
     );
     Ok(())
 }
@@ -360,7 +438,7 @@ impl ParsedRun {
         }
 
         if task_parts.is_empty() {
-            return Err("usage: valkyrie run <task> [--repo <path>]".to_string());
+            return Err("usage: vk run <task> [--repo <path>]".to_string());
         }
 
         Ok(Self {
@@ -458,8 +536,7 @@ impl DefaultsArgs {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         if args.is_empty() {
             return Err(
-                "usage: valkyrie defaults [--repo <path>] [--global] <get|set|unset|export>"
-                    .to_string(),
+                "usage: vk defaults [--repo <path>] [--global] <get|set|unset|export>".to_string(),
             );
         }
 
@@ -479,23 +556,21 @@ impl DefaultsArgs {
         }
 
         if positional.is_empty() {
-            return Err(
-                "usage: valkyrie defaults <get|set|unset|export> [key] [value]".to_string(),
-            );
+            return Err("usage: vk defaults <get|set|unset|export> [key] [value]".to_string());
         }
 
         let action = match positional.remove(0).as_str() {
             "get" => DefaultsAction::Get(positional.first().cloned()),
             "set" => {
                 if positional.len() < 2 {
-                    return Err("usage: valkyrie defaults set <key> <value>".to_string());
+                    return Err("usage: vk defaults set <key> <value>".to_string());
                 }
                 let key = positional.remove(0);
                 DefaultsAction::Set(key, positional.join(" "))
             }
             "unset" => {
                 let Some(key) = positional.first() else {
-                    return Err("usage: valkyrie defaults unset <key>".to_string());
+                    return Err("usage: vk defaults unset <key>".to_string());
                 };
                 DefaultsAction::Unset(key.clone())
             }
@@ -543,7 +618,7 @@ impl DefaultsStore {
                 .map_err(|error| format!("cannot create `{}`: {error}", dir.display()))?;
         }
         let mut content = String::from(
-            "# Generated by `valkyrie defaults set`. Prefer CLI commands over hand editing.\n",
+            "# Generated by `vk defaults set`. Prefer CLI commands over hand editing.\n",
         );
         for (key, value) in &self.values {
             content.push_str(key);
@@ -556,7 +631,7 @@ impl DefaultsStore {
 
     fn to_yaml(&self, scope: DefaultsScope) -> String {
         let mut yaml = format!(
-            "# Generated by `valkyrie defaults export --{}`.\n# Prefer `valkyrie defaults set <key> <value>` over hand-editing.\n",
+            "# Generated by `vk defaults export --{}`.\n# Prefer `vk defaults set <key> <value>` over hand-editing.\n",
             match scope {
                 DefaultsScope::Repo => "repo",
                 DefaultsScope::User => "global",
@@ -653,10 +728,23 @@ impl WriteMode {
             Self::Pr => "pr",
         }
     }
+
+    fn requires_clean_worktree(&self) -> bool {
+        matches!(self, Self::Commit | Self::Push | Self::Pr)
+    }
+
+    fn commits_changes(&self) -> bool {
+        matches!(self, Self::Commit | Self::Push | Self::Pr)
+    }
+
+    fn pushes_changes(&self) -> bool {
+        matches!(self, Self::Push | Self::Pr)
+    }
 }
 
 struct EffectiveSettings {
     validation: Vec<Resolved<String>>,
+    agent_command: Option<Resolved<String>>,
     skip_validation: Resolved<bool>,
     write_mode: WriteMode,
     write_mode_source: String,
@@ -737,6 +825,7 @@ impl EffectiveSettings {
 
         Self {
             validation,
+            agent_command: defaults.get("agent.command").or_else(detect_agent_command),
             skip_validation,
             write_mode,
             write_mode_source,
@@ -767,6 +856,7 @@ impl EffectiveSettings {
   "validation": [
 {}
   ],
+  "agent_command": {},
   "skip_validation": {{ "value": {}, "source": "{}" }},
   "commit": {{ "value": {}, "source": "{}" }},
   "push": {{ "value": {}, "source": "{}" }},
@@ -778,6 +868,14 @@ impl EffectiveSettings {
             self.write_mode.as_str(),
             escape_json(&self.write_mode_source),
             validation,
+            self.agent_command
+                .as_ref()
+                .map(|resolved| format!(
+                    "{{ \"value\": \"{}\", \"source\": \"{}\" }}",
+                    escape_json(&resolved.value),
+                    escape_json(&resolved.source)
+                ))
+                .unwrap_or_else(|| "null".to_string()),
             self.skip_validation.value,
             escape_json(&self.skip_validation.source),
             self.commit.value,
@@ -803,6 +901,12 @@ impl EffectiveSettings {
             for command in &self.validation {
                 output.push_str(&format!("  {}    from {}\n", command.value, command.source));
             }
+        }
+        output.push_str("\nAgent command:\n");
+        if let Some(command) = &self.agent_command {
+            output.push_str(&format!("  {}    from {}\n", command.value, command.source));
+        } else {
+            output.push_str("  not configured    from built-in default\n");
         }
         output.push_str("\nWrite policy:\n");
         output.push_str(&format!(
@@ -845,6 +949,17 @@ impl ValidationReport {
 
     fn failed(&self) -> bool {
         self.results.iter().any(|result| !result.success)
+    }
+
+    fn summary(&self) -> String {
+        if self.skipped {
+            return "skipped".to_string();
+        }
+        if self.results.is_empty() {
+            return "not configured".to_string();
+        }
+        let passed = self.results.iter().filter(|result| result.success).count();
+        format!("{passed}/{} passed", self.results.len())
     }
 
     fn to_markdown(&self) -> String {
@@ -921,6 +1036,890 @@ fn run_validation(repo: &Path, settings: &EffectiveSettings) -> Result<Validatio
         skipped: false,
         results,
     })
+}
+
+struct WriteActionReport {
+    commit: WriteActionOutcome,
+    push: WriteActionOutcome,
+    open_pr: WriteActionOutcome,
+    post_comment: WriteActionOutcome,
+}
+
+impl WriteActionReport {
+    fn skipped(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            commit: WriteActionOutcome::skipped(reason.clone()),
+            push: WriteActionOutcome::skipped(reason.clone()),
+            open_pr: WriteActionOutcome::skipped(reason.clone()),
+            post_comment: WriteActionOutcome::skipped(reason),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.commit.failed()
+            || self.push.failed()
+            || self.open_pr.failed()
+            || self.post_comment.failed()
+    }
+
+    fn committed(&self) -> bool {
+        self.commit.success
+    }
+
+    fn has_remote_effect(&self) -> bool {
+        self.push.success || self.open_pr.success || self.post_comment.success
+    }
+
+    fn commit_summary(&self) -> String {
+        self.commit.summary()
+    }
+
+    fn push_summary(&self) -> String {
+        self.push.summary()
+    }
+
+    fn remote_summary(&self) -> String {
+        if self.open_pr.success && self.post_comment.success {
+            "PR opened, comment posted".to_string()
+        } else if self.open_pr.success {
+            self.open_pr.summary()
+        } else {
+            self.post_comment.summary()
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{ \"commit\": {}, \"push\": {}, \"open_pr\": {}, \"post_comment\": {} }}",
+            self.commit.to_json(),
+            self.push.to_json(),
+            self.open_pr.to_json(),
+            self.post_comment.to_json()
+        )
+    }
+
+    fn to_markdown(&self) -> String {
+        format!(
+            "# Write Actions\n\n## Commit\n\n{}\n\n## Push\n\n{}\n\n## Open PR\n\n{}\n\n## Post comment\n\n{}\n",
+            self.commit.to_markdown(),
+            self.push.to_markdown(),
+            self.open_pr.to_markdown(),
+            self.post_comment.to_markdown()
+        )
+    }
+}
+
+struct WriteActionOutcome {
+    requested: bool,
+    success: bool,
+    skipped: bool,
+    details: String,
+    stdout: String,
+    stderr: String,
+}
+
+impl WriteActionOutcome {
+    fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            requested: false,
+            success: false,
+            skipped: true,
+            details: reason.into(),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn requested_skipped(reason: impl Into<String>) -> Self {
+        Self {
+            requested: true,
+            success: false,
+            skipped: true,
+            details: reason.into(),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn success(details: impl Into<String>, stdout: String, stderr: String) -> Self {
+        Self {
+            requested: true,
+            success: true,
+            skipped: false,
+            details: details.into(),
+            stdout,
+            stderr,
+        }
+    }
+
+    fn failure(details: impl Into<String>, stdout: String, stderr: String) -> Self {
+        Self {
+            requested: true,
+            success: false,
+            skipped: false,
+            details: details.into(),
+            stdout,
+            stderr,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.requested && !self.success && !self.skipped
+    }
+
+    fn summary(&self) -> String {
+        if self.success {
+            self.details.clone()
+        } else if self.skipped {
+            format!("skipped ({})", self.details)
+        } else {
+            format!("failed ({})", self.details)
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{ \"requested\": {}, \"success\": {}, \"skipped\": {}, \"details\": \"{}\" }}",
+            self.requested,
+            self.success,
+            self.skipped,
+            escape_json(&self.details)
+        )
+    }
+
+    fn to_markdown(&self) -> String {
+        let mut markdown = format!(
+            "- Requested: {}\n- Success: {}\n- Skipped: {}\n- Details: {}\n",
+            self.requested, self.success, self.skipped, self.details
+        );
+        if !self.stdout.is_empty() {
+            markdown.push_str("\n### stdout\n\n```text\n");
+            markdown.push_str(&self.stdout);
+            if !self.stdout.ends_with('\n') {
+                markdown.push('\n');
+            }
+            markdown.push_str("```\n");
+        }
+        if !self.stderr.is_empty() {
+            markdown.push_str("\n### stderr\n\n```text\n");
+            markdown.push_str(&self.stderr);
+            if !self.stderr.ends_with('\n') {
+                markdown.push('\n');
+            }
+            markdown.push_str("```\n");
+        }
+        markdown
+    }
+}
+
+fn run_write_actions(
+    repo: &Path,
+    run_dir: &Path,
+    parsed: &ParsedRun,
+    settings: &EffectiveSettings,
+    target_context: &TargetContext,
+    changed: bool,
+    validation: &ValidationReport,
+) -> Result<WriteActionReport, String> {
+    let commit = if settings.write_mode.commits_changes() {
+        commit_changes(repo, &parsed.target, changed)?
+    } else {
+        WriteActionOutcome::skipped(format!(
+            "write mode `{}` does not request commits",
+            settings.write_mode.as_str()
+        ))
+    };
+
+    let push = if settings.write_mode.pushes_changes() && !commit.failed() {
+        push_current_branch(repo)?
+    } else if settings.write_mode.pushes_changes() {
+        WriteActionOutcome::requested_skipped("commit failed")
+    } else {
+        WriteActionOutcome::skipped(format!(
+            "write mode `{}` does not request push",
+            settings.write_mode.as_str()
+        ))
+    };
+
+    let open_pr = if settings.open_pr.value && !commit.failed() && !push.failed() {
+        open_pull_request(repo, run_dir, &parsed.target, target_context, validation)?
+    } else if settings.open_pr.value {
+        WriteActionOutcome::requested_skipped("commit or push failed")
+    } else {
+        WriteActionOutcome::skipped("not requested")
+    };
+
+    let post_comment = if settings.post_comment.value {
+        post_target_comment(
+            repo,
+            run_dir,
+            &parsed.target,
+            validation,
+            &commit,
+            &push,
+            &open_pr,
+        )?
+    } else {
+        WriteActionOutcome::skipped("not requested")
+    };
+
+    Ok(WriteActionReport {
+        commit,
+        push,
+        open_pr,
+        post_comment,
+    })
+}
+
+fn commit_changes(
+    repo: &Path,
+    target: &Target,
+    changed: bool,
+) -> Result<WriteActionOutcome, String> {
+    if !changed {
+        return Ok(WriteActionOutcome::requested_skipped(
+            "no working tree changes to commit",
+        ));
+    }
+    let add = run_command(repo, "git", &["add", "--all"])?;
+    if !add.success {
+        return Ok(WriteActionOutcome::failure(
+            "git add failed",
+            add.stdout,
+            add.stderr,
+        ));
+    }
+
+    let message = commit_message(target);
+    let commit = run_command(repo, "git", &["commit", "-m", &message])?;
+    if commit.success {
+        Ok(WriteActionOutcome::success(
+            format!("created commit `{}`", current_head(repo)?),
+            commit.stdout,
+            commit.stderr,
+        ))
+    } else {
+        Ok(WriteActionOutcome::failure(
+            "git commit failed",
+            commit.stdout,
+            commit.stderr,
+        ))
+    }
+}
+
+fn push_current_branch(repo: &Path) -> Result<WriteActionOutcome, String> {
+    let branch = current_branch(repo)?;
+    let push = run_command(repo, "git", &["push", "-u", "origin", &branch])?;
+    if push.success {
+        Ok(WriteActionOutcome::success(
+            format!("pushed branch `{branch}`"),
+            push.stdout,
+            push.stderr,
+        ))
+    } else {
+        Ok(WriteActionOutcome::failure(
+            format!("git push failed for branch `{branch}`"),
+            push.stdout,
+            push.stderr,
+        ))
+    }
+}
+
+fn open_pull_request(
+    repo: &Path,
+    run_dir: &Path,
+    target: &Target,
+    target_context: &TargetContext,
+    validation: &ValidationReport,
+) -> Result<WriteActionOutcome, String> {
+    let body = render_pr_body(target, target_context, validation);
+    let body_file = run_dir.join("pr-body.md");
+    write_text(body_file.clone(), &body)?;
+    let title = pr_title(target, target_context);
+    let body_file_string = body_file.display().to_string();
+    let output = run_command(
+        repo,
+        "gh",
+        &[
+            "pr",
+            "create",
+            "--title",
+            &title,
+            "--body-file",
+            &body_file_string,
+        ],
+    )?;
+    if output.success {
+        let stdout = output.stdout;
+        let details = stdout
+            .lines()
+            .last()
+            .unwrap_or("opened pull request")
+            .to_string();
+        Ok(WriteActionOutcome::success(details, stdout, output.stderr))
+    } else {
+        Ok(WriteActionOutcome::failure(
+            "gh pr create failed",
+            output.stdout,
+            output.stderr,
+        ))
+    }
+}
+
+fn post_target_comment(
+    repo: &Path,
+    run_dir: &Path,
+    target: &Target,
+    validation: &ValidationReport,
+    commit: &WriteActionOutcome,
+    push: &WriteActionOutcome,
+    open_pr: &WriteActionOutcome,
+) -> Result<WriteActionOutcome, String> {
+    let Some((kind, number)) = target_comment_target(target) else {
+        return Ok(WriteActionOutcome::requested_skipped(
+            "comments are only supported for GitHub issue and PR targets",
+        ));
+    };
+    let body = render_remote_comment(target, validation, commit, push, open_pr);
+    let body_file = run_dir.join("remote-comment.md");
+    write_text(body_file.clone(), &body)?;
+    let body_file_string = body_file.display().to_string();
+    let args = [kind, "comment", number, "--body-file", &body_file_string];
+    let output = run_command(repo, "gh", &args)?;
+    if output.success {
+        Ok(WriteActionOutcome::success(
+            format!("posted {kind} comment #{number}"),
+            output.stdout,
+            output.stderr,
+        ))
+    } else {
+        Ok(WriteActionOutcome::failure(
+            format!("gh {kind} comment failed for #{number}"),
+            output.stdout,
+            output.stderr,
+        ))
+    }
+}
+
+fn target_comment_target(target: &Target) -> Option<(&'static str, &str)> {
+    match target {
+        Target::Issue(number) => Some(("issue", number)),
+        Target::PullRequest(number) => Some(("pr", number)),
+        Target::LocalTask(_) => None,
+    }
+}
+
+fn render_remote_comment(
+    target: &Target,
+    validation: &ValidationReport,
+    commit: &WriteActionOutcome,
+    push: &WriteActionOutcome,
+    open_pr: &WriteActionOutcome,
+) -> String {
+    format!(
+        "## Valkyrie run summary\n\nTarget: {}\n\n- Validation: {}\n- Commit: {}\n- Push: {}\n- PR: {}\n\nArtifacts were captured locally in the Valkyrie run directory.\n",
+        target_label(target),
+        validation.summary(),
+        commit.summary(),
+        push.summary(),
+        open_pr.summary()
+    )
+}
+
+fn render_pr_body(
+    target: &Target,
+    target_context: &TargetContext,
+    validation: &ValidationReport,
+) -> String {
+    format!(
+        "## Summary\n\n{}\n\n## Target\n\n{}\n\n## Validation\n\n{}\n",
+        target_context.problem_statement,
+        target_label(target),
+        validation.summary()
+    )
+}
+
+fn pr_title(target: &Target, target_context: &TargetContext) -> String {
+    match target {
+        Target::Issue(number) => format!("Fix issue #{number}"),
+        Target::PullRequest(number) => format!("Update PR #{number}"),
+        Target::LocalTask(_) => target_context.problem_statement.clone(),
+    }
+}
+
+fn commit_message(target: &Target) -> String {
+    match target {
+        Target::LocalTask(task) => format!("Apply Valkyrie task: {}", first_line(task)),
+        Target::Issue(number) => format!("Fix issue #{number}"),
+        Target::PullRequest(number) => format!("Update PR #{number}"),
+    }
+}
+
+fn target_label(target: &Target) -> String {
+    match target {
+        Target::LocalTask(task) => format!("local task `{}`", first_line(task)),
+        Target::Issue(number) => format!("GitHub issue #{number}"),
+        Target::PullRequest(number) => format!("GitHub PR #{number}"),
+    }
+}
+
+fn first_line(value: &str) -> &str {
+    value.lines().next().unwrap_or(value)
+}
+
+fn ensure_clean_worktree(repo: &Path) -> Result<(), String> {
+    let status = git_output(repo, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "write mode requires a clean worktree before the agent runs; commit, stash, or reset existing changes first:\n{status}"
+        ))
+    }
+}
+
+fn current_branch(repo: &Path) -> Result<String, String> {
+    let branch = git_output(repo, &["branch", "--show-current"])?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        Err("cannot push because HEAD is detached".to_string())
+    } else {
+        Ok(branch.to_string())
+    }
+}
+
+fn current_head(repo: &Path) -> Result<String, String> {
+    Ok(git_output(repo, &["rev-parse", "--short", "HEAD"])?
+        .trim()
+        .to_string())
+}
+
+struct CommandOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_command(repo: &Path, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("cannot run {program}: {error}"))?;
+    Ok(CommandOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+struct AgentRunReport {
+    invoked: bool,
+    success: bool,
+    exit_code: Option<i32>,
+}
+
+fn run_agent(
+    repo: &Path,
+    run_dir: &Path,
+    parsed: &ParsedRun,
+    settings: &EffectiveSettings,
+    target_context: &TargetContext,
+    plan: &str,
+) -> Result<AgentRunReport, String> {
+    let command = settings.agent_command.as_ref().ok_or_else(|| {
+        "uvx brokk acp is required for write runs but uvx was not found. Install uv or set VALKYRIE_AGENT_COMMAND/agent.command to an ACP agent command.".to_string()
+    })?;
+    if command.value != "uvx brokk acp" {
+        return Err("custom agent.command values are not supported yet; Valkyrie currently runs the default ACP command `uvx brokk acp`.".to_string());
+    }
+    let prompt = render_agent_prompt(parsed, settings, target_context, plan);
+    write_text(run_dir.join("agent-prompt.md"), &prompt)?;
+    let runner = write_acp_runner(run_dir, repo, parsed, &prompt, &command.value)?;
+    append_event(
+        run_dir,
+        &format!(
+            "{{\"event\":\"agent_started\",\"command\":\"{}\",\"transport\":\"acp\"}}\n",
+            escape_json(&command.value)
+        ),
+    )?;
+
+    let output = Command::new("uvx")
+        .args(["--from", "brokk", "python"])
+        .arg(&runner)
+        .current_dir(repo)
+        .env("VALKYRIE_RUN_DIR", run_dir)
+        .env("VALKYRIE_TARGET_KIND", parsed.target.kind())
+        .output()
+        .map_err(|error| format!("cannot start ACP client for `{}`: {error}", command.value))?;
+
+    let report = AgentRunReport {
+        invoked: true,
+        success: output.status.success(),
+        exit_code: output.status.code(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    write_text(
+        run_dir.join("agent.md"),
+        &render_agent_markdown(
+            &command.value,
+            &command.source,
+            report.exit_code,
+            report.success,
+            &stdout,
+            &stderr,
+        ),
+    )?;
+    append_event(
+        run_dir,
+        &format!(
+            "{{\"event\":\"agent_finished\",\"success\":{},\"exit_code\":{}}}\n",
+            report.success,
+            report
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ),
+    )?;
+
+    Ok(report)
+}
+
+fn render_acp_runner_script(
+    run_dir: &Path,
+    repo: &Path,
+    parsed: &ParsedRun,
+    prompt: &str,
+    agent_command: &str,
+) -> String {
+    format!(
+        r#"import asyncio
+import json
+import os
+import pathlib
+import shlex
+import sys
+from typing import Any
+
+import acp
+from acp import connect_to_agent, spawn_stdio_transport, text_block
+from acp.schema import (
+    ClientCapabilities,
+    FileSystemCapabilities,
+    Implementation,
+    RequestPermissionResponse,
+    ReadTextFileResponse,
+    WriteTextFileResponse,
+)
+
+REPO = pathlib.Path({repo_json}).resolve()
+RUN_DIR = pathlib.Path({run_dir_json}).resolve()
+PROMPT = {prompt_json}
+TARGET_KIND = {target_kind_json}
+AGENT_COMMAND = {agent_command_json}
+ACP_READ_LIMIT = 16 * 1024 * 1024
+MAX_EVENT_STRING = 32_000
+MAX_EVENT_LIST_ITEMS = 40
+MAX_EVENT_OBJECT_ITEMS = 80
+TERMINALS: dict[str, dict[str, Any]] = {{}}
+NEXT_TERMINAL_ID = 0
+
+
+def sanitize_for_event(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[truncated: maximum event depth exceeded]"
+    if isinstance(value, str):
+        if len(value) > MAX_EVENT_STRING:
+            omitted = len(value) - MAX_EVENT_STRING
+            return value[:MAX_EVENT_STRING] + f"\n[truncated by Valkyrie: {{omitted}} characters omitted from event log]"
+        return value
+    if isinstance(value, list):
+        items = [sanitize_for_event(item, depth + 1) for item in value[:MAX_EVENT_LIST_ITEMS]]
+        if len(value) > MAX_EVENT_LIST_ITEMS:
+            items.append(f"[truncated by Valkyrie: {{len(value) - MAX_EVENT_LIST_ITEMS}} list items omitted]")
+        return items
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {{}}
+        items = list(value.items())
+        for key, item in items[:MAX_EVENT_OBJECT_ITEMS]:
+            sanitized[str(key)] = sanitize_for_event(item, depth + 1)
+        if len(items) > MAX_EVENT_OBJECT_ITEMS:
+            sanitized["_valkyrie_truncated"] = f"{{len(items) - MAX_EVENT_OBJECT_ITEMS}} object entries omitted"
+        return sanitized
+    return value
+
+
+def log_event(event: dict[str, Any]) -> None:
+    event = sanitize_for_event(event)
+    with (RUN_DIR / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\\n")
+
+
+def inside_repo(path: pathlib.Path) -> bool:
+    try:
+        path.resolve().relative_to(REPO)
+        return True
+    except ValueError:
+        return False
+
+
+class ValkyrieClient:
+    async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        payload = update.model_dump(by_alias=True, exclude_none=True) if hasattr(update, "model_dump") else update
+        log_event({{"event": "session_update", "session_id": session_id, "update": payload}})
+
+    async def request_permission(self, options: list[Any], session_id: str, tool_call: Any, **kwargs: Any) -> RequestPermissionResponse:
+        chosen = None
+        for option in options:
+            kind = getattr(option, "kind", "")
+            if kind in ("allow_once", "allow_always"):
+                chosen = option
+                break
+        if chosen is None:
+            log_event({{"event": "permission_denied", "session_id": session_id}})
+            return RequestPermissionResponse(outcome={{"outcome": "cancelled"}})
+        option_id = getattr(chosen, "option_id", None) or getattr(chosen, "optionId", None)
+        log_event({{"event": "permission_allowed", "session_id": session_id, "option_id": option_id}})
+        return RequestPermissionResponse(outcome={{"outcome": "selected", "optionId": option_id}})
+
+    async def read_text_file(self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **kwargs: Any) -> ReadTextFileResponse:
+        target = (REPO / path).resolve() if not pathlib.Path(path).is_absolute() else pathlib.Path(path).resolve()
+        if not inside_repo(target):
+            raise RuntimeError(f"refusing to read outside repo: {{path}}")
+        text = target.read_text(encoding="utf-8")
+        if line is not None:
+            lines = text.splitlines(keepends=True)
+            text = "".join(lines[line:])
+        requested_limit = limit if limit is not None else len(text)
+        effective_limit = min(requested_limit, ACP_READ_LIMIT)
+        truncated = len(text) > effective_limit
+        text = text[:effective_limit]
+        if truncated:
+            text += (
+                f"\n[Valkyrie truncated this file read to {{effective_limit}} characters. "
+                "Request a smaller range or use search before reading more.]\n"
+            )
+        return ReadTextFileResponse(content=text)
+
+    async def write_text_file(self, content: str, path: str, session_id: str, **kwargs: Any) -> WriteTextFileResponse:
+        target = (REPO / path).resolve() if not pathlib.Path(path).is_absolute() else pathlib.Path(path).resolve()
+        if not inside_repo(target):
+            raise RuntimeError(f"refusing to write outside repo: {{path}}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        log_event({{"event": "file_written", "session_id": session_id, "path": str(target.relative_to(REPO))}})
+        return WriteTextFileResponse()
+
+    async def create_terminal(self, command: str, session_id: str, args: list[str] | None = None, cwd: str | None = None, env: list[Any] | None = None, output_byte_limit: int | None = None, **kwargs: Any) -> dict[str, str]:
+        global NEXT_TERMINAL_ID
+        workdir = (REPO / cwd).resolve() if cwd and not pathlib.Path(cwd).is_absolute() else pathlib.Path(cwd or REPO).resolve()
+        if not inside_repo(workdir):
+            raise RuntimeError(f"refusing to run terminal outside repo: {{cwd}}")
+        merged_env = dict(os.environ)
+        for item in env or []:
+            name = getattr(item, "name", None)
+            value = getattr(item, "value", None)
+            if name is not None and value is not None:
+                merged_env[name] = value
+        if args:
+            process = await asyncio.create_subprocess_exec(
+                command,
+                *args,
+                cwd=str(workdir),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            rendered = " ".join([command, *args])
+        else:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=str(workdir),
+                env=merged_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            rendered = command
+        terminal_id = f"terminal-{{NEXT_TERMINAL_ID}}"
+        NEXT_TERMINAL_ID += 1
+        terminal = {{"process": process, "output": bytearray(), "limit": output_byte_limit or 200_000, "truncated": False}}
+        TERMINALS[terminal_id] = terminal
+        log_event({{"event": "terminal_started", "session_id": session_id, "terminal_id": terminal_id, "command": rendered}})
+
+        async def pump() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                output = terminal["output"]
+                output.extend(chunk)
+                limit = terminal["limit"]
+                if len(output) > limit:
+                    del output[:-limit]
+                    terminal["truncated"] = True
+
+        terminal["pump"] = asyncio.create_task(pump())
+        return {{"terminalId": terminal_id}}
+
+    async def terminal_output(self, session_id: str, terminal_id: str, **kwargs: Any) -> dict[str, Any]:
+        terminal = TERMINALS[terminal_id]
+        process = terminal["process"]
+        output = bytes(terminal["output"]).decode("utf-8", errors="replace")
+        exit_status = None if process.returncode is None else {{"exitCode": process.returncode}}
+        return {{"output": output, "truncated": terminal["truncated"], "exitStatus": exit_status}}
+
+    async def wait_for_terminal_exit(self, session_id: str, terminal_id: str, **kwargs: Any) -> dict[str, Any]:
+        terminal = TERMINALS[terminal_id]
+        process = terminal["process"]
+        exit_code = await process.wait()
+        pump = terminal.get("pump")
+        if pump is not None:
+            await pump
+        log_event({{"event": "terminal_finished", "session_id": session_id, "terminal_id": terminal_id, "exit_code": exit_code}})
+        return {{"exitCode": exit_code}}
+
+    async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> dict[str, Any]:
+        terminal = TERMINALS.get(terminal_id)
+        if terminal is not None:
+            terminal["process"].kill()
+        return {{}}
+
+    async def release_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> dict[str, Any]:
+        TERMINALS.pop(terminal_id, None)
+        return {{}}
+
+
+async def main() -> int:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    log_event({{"event": "acp_client_started", "target_kind": TARGET_KIND}})
+    agent_args = shlex.split(AGENT_COMMAND)
+    if not agent_args:
+        raise RuntimeError("agent command is empty")
+    async with spawn_stdio_transport(*agent_args, cwd=str(REPO), limit=ACP_READ_LIMIT) as (reader, writer, process):
+        conn = connect_to_agent(ValkyrieClient(), writer, reader)
+        await conn.initialize(
+            protocol_version=acp.PROTOCOL_VERSION,
+            client_info=Implementation(name="valkyrie", version="0.2.0"),
+            client_capabilities=ClientCapabilities(
+                fs=FileSystemCapabilities(read_text_file=True, write_text_file=True),
+                terminal=True,
+            ),
+        )
+        session = await conn.new_session(cwd=str(REPO), mcp_servers=[])
+        response = await conn.prompt(
+            session_id=session.session_id,
+            prompt=[text_block(PROMPT)],
+            message_id="valkyrie-run",
+        )
+        log_event({{
+            "event": "agent_prompt_finished",
+            "session_id": session.session_id,
+            "stop_reason": response.stop_reason,
+        }})
+        with (RUN_DIR / "acp-result.json").open("w", encoding="utf-8") as handle:
+            json.dump(response.model_dump(by_alias=True, exclude_none=True), handle, indent=2)
+        await conn.close()
+        return 0 if response.stop_reason in ("end_turn", "max_turn_requests") else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(asyncio.run(main()))
+    except Exception as exc:
+        log_event({{"event": "acp_client_failed", "error": str(exc)}})
+        print(f"ACP client failed: {{exc}}", file=sys.stderr)
+        raise
+"#,
+        repo_json = json_string_literal(&repo.display().to_string()),
+        run_dir_json = json_string_literal(&run_dir.display().to_string()),
+        prompt_json = json_string_literal(prompt),
+        target_kind_json = json_string_literal(parsed.target.kind()),
+        agent_command_json = json_string_literal(agent_command),
+    )
+}
+
+fn write_acp_runner(
+    run_dir: &Path,
+    repo: &Path,
+    parsed: &ParsedRun,
+    prompt: &str,
+    agent_command: &str,
+) -> Result<PathBuf, String> {
+    let script = render_acp_runner_script(run_dir, repo, parsed, prompt, agent_command);
+    let runner = run_dir.join("acp-runner.py");
+    write_text(runner.clone(), &script)?;
+    Ok(runner)
+}
+
+fn render_agent_prompt(
+    parsed: &ParsedRun,
+    settings: &EffectiveSettings,
+    target_context: &TargetContext,
+    plan: &str,
+) -> String {
+    let validations = if settings.skip_validation.value {
+        "Validation is disabled for this run.".to_string()
+    } else {
+        settings
+            .validation
+            .iter()
+            .map(|command| format!("- `{}` ({})", command.value, command.source))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let target = match &parsed.target {
+        Target::LocalTask(task) => format!("local task: {task}"),
+        Target::Issue(number) => format!("GitHub issue #{number}"),
+        Target::PullRequest(number) => format!("GitHub pull request #{number}"),
+    };
+
+    format!(
+        "# Valkyrie Agent Task\n\nYou are running inside the repository. Modify the working tree to complete the requested task. Keep changes focused and safe. Valkyrie will handle any requested commit, push, PR creation, or remote comments after validation; do not perform remote writes yourself.\n\n## Target\n\n{}\n\n## Problem statement\n\n{}\n\n## Context\n\n{}\n\n## Write policy\n\n- Mode: `{}` ({})\n\n## Validation commands Valkyrie will run after you finish\n\n{}\n\n## Valkyrie plan\n\n{}\n",
+        target,
+        target_context.problem_statement,
+        target_context.summary,
+        settings.write_mode.as_str(),
+        settings.write_mode_source,
+        validations,
+        plan
+    )
+}
+
+fn render_agent_markdown(
+    command: &str,
+    source: &str,
+    exit_code: Option<i32>,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!(
+        "# Agent\n\n- Command: `{}`\n- Source: {}\n- Exit code: {}\n- Status: {}\n\n## stdout\n\n```text\n{}{}\n```\n\n## stderr\n\n```text\n{}{}\n```\n",
+        command,
+        source,
+        exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".to_string()),
+        if success { "passed" } else { "failed" },
+        stdout,
+        if stdout.ends_with('\n') { "" } else { "\n" },
+        stderr,
+        if stderr.ends_with('\n') { "" } else { "\n" }
+    )
+}
+
+fn append_event(run_dir: &Path, event: &str) -> Result<(), String> {
+    let path = run_dir.join("events.jsonl");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open `{}`: {error}", path.display()))?;
+    file.write_all(event.as_bytes())
+        .map_err(|error| format!("cannot write `{}`: {error}", path.display()))
 }
 
 struct TargetContext {
@@ -1111,7 +2110,7 @@ fn render_plan(
         .join("\n");
 
     format!(
-        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Target context\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Prepare for agent execution through anvil and code intelligence through bifrost.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
+        "# Valkyrie Plan\n\n## Problem statement\n\n{}\n\n## Target context\n\n{}\n\n## Proposed execution\n\n- Resolve local repository context.\n- Record effective settings and run artifacts.\n- Invoke the ACP agent through `uvx brokk acp`.\n\n## Validation\n\n{}\n\n## Write mode\n\n- `{}` ({}){}\n\n## Stop conditions\n\n- Stop before remote writes unless explicit flags are present.\n- Stop if validation fails repeatedly.\n- Stop if file-change limits are exceeded.\n",
         target_context.problem_statement,
         target_context.summary,
         validation,
@@ -1284,6 +2283,10 @@ fn escape_json(value: &str) -> String {
         .replace('\t', "\\t")
 }
 
+fn json_string_literal(value: &str) -> String {
+    format!("\"{}\"", escape_json(value))
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1296,11 +2299,23 @@ fn env_key_for_default(key: &str) -> Option<&'static str> {
     match key {
         "validation.command" => Some("VALKYRIE_VALIDATION_COMMAND"),
         "validation.skip" => Some("VALKYRIE_SKIP_VALIDATION"),
+        "agent.command" => Some("VALKYRIE_AGENT_COMMAND"),
         "write.commit" => Some("VALKYRIE_WRITE_COMMIT"),
         "write.push" => Some("VALKYRIE_WRITE_PUSH"),
         "write.open_pr" => Some("VALKYRIE_WRITE_OPEN_PR"),
         "write.post_comment" => Some("VALKYRIE_WRITE_POST_COMMENT"),
         _ => None,
+    }
+}
+
+fn detect_agent_command() -> Option<Resolved<String>> {
+    if command_exists("uvx") {
+        Some(Resolved::new(
+            "uvx brokk acp".to_string(),
+            "detected uvx brokk acp",
+        ))
+    } else {
+        None
     }
 }
 
@@ -1316,7 +2331,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  valkyrie defaults [--repo <path>] [--global] get [key]\n  valkyrie defaults [--repo <path>] [--global] set <key> <value>\n  valkyrie defaults [--repo <path>] [--global] unset <key>\n  valkyrie defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -1480,7 +2495,7 @@ mod tests {
         assert!(!store.values.contains_key("ignored-without-equals"));
 
         let yaml = store.to_yaml(DefaultsScope::Repo);
-        assert!(yaml.contains("# Generated by `valkyrie defaults export --repo`."));
+        assert!(yaml.contains("# Generated by `vk defaults export --repo`."));
         assert!(yaml.contains("validation:\n  command: cargo test"));
 
         fs::remove_file(path).unwrap();
@@ -1605,6 +2620,82 @@ mod tests {
         assert!(markdown.contains("- Source: cli"));
         assert!(markdown.contains("- Status: passed"));
         assert!(markdown.contains("ok"));
+    }
+
+    #[test]
+    fn write_mode_helpers_select_commit_and_remote_actions() {
+        assert!(!WriteMode::LocalPatch.requires_clean_worktree());
+        assert!(!WriteMode::LocalPatch.commits_changes());
+        assert!(!WriteMode::Commit.pushes_changes());
+        assert!(WriteMode::Commit.requires_clean_worktree());
+        assert!(WriteMode::Commit.commits_changes());
+        assert!(WriteMode::Push.pushes_changes());
+        assert!(WriteMode::Pr.pushes_changes());
+    }
+
+    #[test]
+    fn target_comment_target_supports_only_remote_targets() {
+        let issue = Target::Issue("12".to_string());
+        let pr = Target::PullRequest("34".to_string());
+        let local = Target::LocalTask("fix docs".to_string());
+
+        assert_eq!(target_comment_target(&issue), Some(("issue", "12")));
+        assert_eq!(target_comment_target(&pr), Some(("pr", "34")));
+        assert_eq!(target_comment_target(&local), None);
+    }
+
+    #[test]
+    fn render_remote_comment_summarizes_write_actions() {
+        let validation = ValidationReport {
+            skipped: false,
+            results: vec![ValidationCommandResult {
+                command: "cargo test".to_string(),
+                source: "inferred".to_string(),
+                success: true,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            }],
+        };
+        let commit =
+            WriteActionOutcome::success("created commit `abc1234`", String::new(), String::new());
+        let push = WriteActionOutcome::skipped("not requested");
+        let open_pr = WriteActionOutcome::skipped("not requested");
+
+        let comment = render_remote_comment(
+            &Target::PullRequest("11".to_string()),
+            &validation,
+            &commit,
+            &push,
+            &open_pr,
+        );
+
+        assert!(comment.contains("Target: GitHub PR #11"));
+        assert!(comment.contains("- Validation: 1/1 passed"));
+        assert!(comment.contains("- Commit: created commit `abc1234`"));
+        assert!(comment.contains("- Push: skipped (not requested)"));
+    }
+
+    #[test]
+    fn write_action_report_marks_failures_and_remote_effects() {
+        let success =
+            WriteActionOutcome::success("posted pr comment #11", String::new(), String::new());
+        let failure =
+            WriteActionOutcome::failure("git push failed", String::new(), "denied".to_string());
+        let skipped = WriteActionOutcome::skipped("not requested");
+
+        assert!(success.summary().contains("posted pr comment"));
+        assert!(failure.failed());
+        assert!(!skipped.failed());
+
+        let report = WriteActionReport {
+            commit: skipped,
+            push: WriteActionOutcome::skipped("not requested"),
+            open_pr: WriteActionOutcome::skipped("not requested"),
+            post_comment: success,
+        };
+        assert!(report.has_remote_effect());
+        assert!(!report.failed());
     }
 
     #[test]

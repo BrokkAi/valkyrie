@@ -18,20 +18,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: valkyrie-linux-x86_64
-            binary_path: target/x86_64-unknown-linux-gnu/release/valkyrie
+            artifact_name: vk-linux-x86_64
+            binary_path: target/x86_64-unknown-linux-gnu/release/vk
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: valkyrie-macos-aarch64
-            binary_path: target/aarch64-apple-darwin/release/valkyrie
+            artifact_name: vk-macos-aarch64
+            binary_path: target/aarch64-apple-darwin/release/vk
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: valkyrie-windows-x86_64.exe
-            binary_path: target/x86_64-pc-windows-msvc/release/valkyrie.exe
+            artifact_name: vk-windows-x86_64.exe
+            binary_path: target/x86_64-pc-windows-msvc/release/vk.exe
           - os: ubuntu-latest
             target: aarch64-linux-android
-            artifact_name: valkyrie-android-aarch64
-            binary_path: target/aarch64-linux-android/release/valkyrie
+            artifact_name: vk-android-aarch64
+            binary_path: target/aarch64-linux-android/release/vk
             android: true
     runs-on: ${{ matrix.os }}
     steps:
