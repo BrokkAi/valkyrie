@@ -28,6 +28,7 @@ fn run() -> Result<(), String> {
         "plan" => command_plan(args),
         "issue" => command_issue(args),
         "pr" => command_pr(args),
+        "review" => command_review(args),
         "defaults" => command_defaults(args),
         "status" => command_show_artifact(args, "result.json"),
         "logs" => command_show_artifact(args, "events.jsonl"),
@@ -302,6 +303,178 @@ fn command_pr(args: Vec<String>) -> Result<(), String> {
     command_run(rewritten, plan_only)
 }
 
+fn command_review(args: Vec<String>) -> Result<(), String> {
+    let parsed = ParsedReview::parse(args)?;
+    let repo = resolve_repo(&parsed.repo)?;
+    let target_context = resolve_pr_context(&parsed.number, &repo);
+    let diff = gh_pr_diff(&parsed.number, &repo);
+
+    let run_id = make_run_id(&format!("review-pr-{}", parsed.number));
+    let run_dir = repo.join(".valkyrie").join("runs").join(&run_id);
+    fs::create_dir_all(&run_dir).map_err(|error| {
+        format!(
+            "cannot create run directory `{}`: {error}",
+            run_dir.display()
+        )
+    })?;
+
+    let target = Target::PullRequest(parsed.number.clone());
+    write_text(
+        run_dir.join("target.json"),
+        &render_target_json(&target, &repo),
+    )?;
+    write_text(run_dir.join("context.md"), &target_context.to_markdown())?;
+    if let Some(metadata_json) = &target_context.metadata_json {
+        write_text(run_dir.join("pr.json"), metadata_json)?;
+    }
+    match &diff {
+        Ok(diff) => write_text(run_dir.join("pr.diff"), diff)?,
+        Err(error) => write_text(
+            run_dir.join("pr.diff"),
+            &format!("Diff could not be fetched: {error}\n"),
+        )?,
+    }
+
+    let review_path = run_dir.join("review.md");
+    let plan = render_review_plan(&parsed, &target_context);
+    write_text(run_dir.join("plan.md"), &plan)?;
+    write_text(
+        run_dir.join("events.jsonl"),
+        &format!(
+            "{{\"event\":\"review_created\",\"run_id\":\"{}\",\"pr\":\"{}\"}}\n",
+            escape_json(&run_id),
+            escape_json(&parsed.number)
+        ),
+    )?;
+
+    if !parsed.json {
+        println!("Review created: {run_id}");
+        println!("Artifacts: {}", run_dir.display());
+        println!();
+        println!("{plan}");
+    }
+
+    if parsed.plan_only {
+        write_text(
+            run_dir.join("summary.md"),
+            "# Summary\n\nReview planning completed. The PR was not analyzed by an agent.\n",
+        )?;
+        write_text(
+            run_dir.join("result.json"),
+            &format!(
+                "{{\n  \"run_id\": \"{}\",\n  \"state\": \"planned\",\n  \"run_dir\": \"{}\"\n}}\n",
+                escape_json(&run_id),
+                escape_json(&run_dir.display().to_string())
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let defaults = DefaultsResolver::load(&repo)?;
+    let agent_command = defaults
+        .get("agent.command")
+        .or_else(detect_agent_command)
+        .ok_or_else(|| {
+            "uvx brokk acp is required to review a PR but uvx was not found. Install uv or set VALKYRIE_AGENT_COMMAND/agent.command to an ACP agent command.".to_string()
+        })?;
+
+    let relative_review_path = review_path
+        .strip_prefix(&repo)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| review_path.display().to_string());
+    let prompt = render_review_prompt(
+        &parsed,
+        &target_context,
+        diff.as_deref().ok(),
+        &relative_review_path,
+    );
+    let agent = invoke_acp_agent(&repo, &run_dir, target.kind(), &agent_command, &prompt)?;
+
+    if fs::read_to_string(&review_path)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        write_text(
+            review_path.clone(),
+            &format!(
+                "# PR #{} Review\n\nThe agent did not produce a review file. See `agent.md` for details.\n",
+                parsed.number
+            ),
+        )?;
+    }
+    let review = fs::read_to_string(&review_path).unwrap_or_default();
+
+    let post = if parsed.post_comment && agent.success {
+        post_pr_review(&repo, &parsed, &review_path)?
+    } else if parsed.post_comment {
+        WriteActionOutcome::requested_skipped("agent failed before posting the review")
+    } else {
+        WriteActionOutcome::skipped("not requested")
+    };
+    write_text(run_dir.join("write-actions.md"), &post.to_markdown())?;
+
+    let state = review_state(agent.success, &post);
+
+    write_text(
+        run_dir.join("summary.md"),
+        &format!(
+            "# Summary\n\nValkyrie reviewed GitHub PR #{}.\n\n- Agent: `{}`.\n- Decision: `{}`.\n- Posted comment: {}.\n\nSee `review.md`, `pr.diff`, and `agent.md` in this run directory for details.\n",
+            parsed.number,
+            if agent.success { "completed" } else { "failed" },
+            parsed.decision.as_str(),
+            post.summary(),
+        ),
+    )?;
+    write_text(
+        run_dir.join("result.json"),
+        &format!(
+            "{{\n  \"run_id\": \"{}\",\n  \"state\": \"{}\",\n  \"run_dir\": \"{}\",\n  \"agent_success\": {},\n  \"decision\": \"{}\",\n  \"posted\": {}\n}}\n",
+            escape_json(&run_id),
+            state,
+            escape_json(&run_dir.display().to_string()),
+            agent.success,
+            parsed.decision.as_str(),
+            post.success
+        ),
+    )?;
+
+    if parsed.json {
+        println!(
+            "{{\n  \"run_id\": \"{}\",\n  \"state\": \"{}\",\n  \"run_dir\": \"{}\"\n}}",
+            escape_json(&run_id),
+            state,
+            escape_json(&run_dir.display().to_string())
+        );
+    } else {
+        println!();
+        println!("Review finished: {state}");
+        println!("Review: {}", review_path.display());
+        println!("Comment: {}", post.summary());
+        if parsed.verbose && !review.trim().is_empty() {
+            println!();
+            println!("{review}");
+        }
+    }
+
+    if !agent.success {
+        return Err(format!(
+            "review agent failed for run `{}`. See `{}`",
+            run_id,
+            run_dir.join("agent.md").display()
+        ));
+    }
+    if post.failed() {
+        return Err(format!(
+            "posting the review failed for run `{}`. See `{}`",
+            run_id,
+            run_dir.join("write-actions.md").display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn command_defaults(args: Vec<String>) -> Result<(), String> {
     let defaults_args = DefaultsArgs::parse(args)?;
     let repo = resolve_repo(&defaults_args.repo)?;
@@ -501,6 +674,204 @@ fn rewrite_target_alias(args: Vec<String>) -> Vec<String> {
         rewritten
     } else {
         args
+    }
+}
+
+/// The recommendation an agent-produced PR review can carry.
+///
+/// `Comment` is the safe default: it leaves feedback without approving or
+/// blocking the pull request. The stronger decisions map onto the
+/// corresponding `gh pr review` events and only take effect when the user
+/// explicitly opts into posting the review.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewDecision {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl ReviewDecision {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Comment => "comment",
+            Self::Approve => "approve",
+            Self::RequestChanges => "request-changes",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "comment" => Ok(Self::Comment),
+            "approve" => Ok(Self::Approve),
+            "request-changes" | "request_changes" | "changes" => Ok(Self::RequestChanges),
+            other => Err(format!(
+                "unknown review decision `{other}`; expected one of comment, approve, request-changes"
+            )),
+        }
+    }
+
+    /// The `gh pr review` flag that submits this decision.
+    fn gh_flag(&self) -> &'static str {
+        match self {
+            Self::Comment => "--comment",
+            Self::Approve => "--approve",
+            Self::RequestChanges => "--request-changes",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ParsedReview {
+    number: String,
+    repo: PathBuf,
+    plan_only: bool,
+    post_comment: bool,
+    decision: ReviewDecision,
+    json: bool,
+    verbose: bool,
+}
+
+impl ParsedReview {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let mut number: Option<String> = None;
+        let mut repo = PathBuf::from(".");
+        let mut plan_only = false;
+        let mut post_comment = false;
+        let mut decision = ReviewDecision::Comment;
+        let mut json = false;
+        let mut verbose = false;
+
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--repo" => repo = PathBuf::from(next_value(&mut iter, "--repo")?),
+                "--decision" => {
+                    decision = ReviewDecision::parse(&next_value(&mut iter, "--decision")?)?
+                }
+                "--approve" => decision = ReviewDecision::Approve,
+                "--request-changes" => decision = ReviewDecision::RequestChanges,
+                "--plan" => plan_only = true,
+                "--post-comment" | "--post-review" => post_comment = true,
+                "--json" => json = true,
+                "--verbose" => verbose = true,
+                flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+                value if number.is_none() => number = Some(value.to_string()),
+                value => return Err(format!("unexpected argument `{value}`")),
+            }
+        }
+
+        let number = number
+            .ok_or_else(|| "usage: vk review <number> [--repo <path>] [--plan]".to_string())?;
+
+        Ok(Self {
+            number,
+            repo,
+            plan_only,
+            post_comment,
+            decision,
+            json,
+            verbose,
+        })
+    }
+}
+
+fn render_review_plan(parsed: &ParsedReview, target_context: &TargetContext) -> String {
+    let post = if parsed.post_comment {
+        format!(
+            "Submit a `{}` review to GitHub after analysis.",
+            parsed.decision.as_str()
+        )
+    } else {
+        "Keep the review local; remote submission is disabled.".to_string()
+    };
+
+    format!(
+        "# Valkyrie PR Review Plan\n\n## Target\n\n{}\n\n## Summary\n\n{}\n\n## Proposed execution\n\n- Fetch PR metadata and diff with the GitHub CLI.\n- Ask the ACP agent to analyze the diff without modifying the working tree.\n- Capture the review as `review.md` in the run directory.\n\n## Decision\n\n- Recommendation: `{}`\n- {}\n\n## Stop conditions\n\n- Never modify the working tree during a review.\n- Do not submit a remote review unless `--post-comment` is present.\n",
+        target_context.problem_statement,
+        target_context.summary,
+        parsed.decision.as_str(),
+        post
+    )
+}
+
+fn render_review_prompt(
+    parsed: &ParsedReview,
+    target_context: &TargetContext,
+    diff: Option<&str>,
+    review_path: &str,
+) -> String {
+    let diff_section = match diff {
+        Some(diff) if !diff.trim().is_empty() => {
+            format!("```diff\n{}\n```", diff.trim_end())
+        }
+        _ => "The diff could not be fetched automatically. Use the available tools (for example `gh pr diff`) to inspect the changes before reviewing.".to_string(),
+    };
+
+    format!(
+        "# Valkyrie PR Review Task\n\nYou are reviewing GitHub pull request #{number}. This is a read-only review: do NOT modify the working tree, do not commit, and do not run write commands. Analyze the change and produce a clear, actionable code review.\n\n## Target\n\n{problem}\n\n## Context\n\n{summary}\n\n## Pull request diff\n\n{diff}\n\n## Required output\n\nWrite your review to `{review_path}` using this Markdown structure:\n\n1. `# PR #{number} Review`\n2. `## Summary` — a short description of what the PR does.\n3. `## Findings` — a list of issues, each marked `[blocker]`, `[major]`, `[minor]`, or `[nit]`, referencing files and lines where possible.\n4. `## Tests` — comments about test coverage.\n5. `## Recommendation` — one of `approve`, `request changes`, or `comment`, with a one-line justification.\n\nKeep the review focused, specific, and actionable. The maintainer requested an initial recommendation of `{decision}`, but base your final recommendation on the actual diff.\n",
+        number = parsed.number,
+        problem = target_context.problem_statement,
+        summary = target_context.summary,
+        diff = diff_section,
+        review_path = review_path,
+        decision = parsed.decision.as_str(),
+    )
+}
+
+fn post_pr_review(
+    repo: &Path,
+    parsed: &ParsedReview,
+    review_path: &Path,
+) -> Result<WriteActionOutcome, String> {
+    let body_file = review_path.display().to_string();
+    let args = gh_pr_review_args(&parsed.number, parsed.decision, &body_file);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_command(repo, "gh", &arg_refs)?;
+    if output.success {
+        Ok(WriteActionOutcome::success(
+            format!(
+                "submitted `{}` review on PR #{}",
+                parsed.decision.as_str(),
+                parsed.number
+            ),
+            output.stdout,
+            output.stderr,
+        ))
+    } else {
+        Ok(WriteActionOutcome::failure(
+            format!("gh pr review failed for PR #{}", parsed.number),
+            output.stdout,
+            output.stderr,
+        ))
+    }
+}
+
+/// Build the `gh pr review` argument list for the requested decision.
+///
+/// Extracted as a pure function so the argument shape can be unit-tested
+/// without shelling out to the GitHub CLI.
+fn gh_pr_review_args(number: &str, decision: ReviewDecision, body_file: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "review".to_string(),
+        number.to_string(),
+        decision.gh_flag().to_string(),
+        "--body-file".to_string(),
+        body_file.to_string(),
+    ]
+}
+
+/// Map the agent outcome and review-posting outcome onto a result state.
+///
+/// Pure helper so the state machine can be unit-tested without running an
+/// agent or the GitHub CLI.
+fn review_state(agent_success: bool, post: &WriteActionOutcome) -> &'static str {
+    if !agent_success || post.failed() {
+        "failed"
+    } else if post.success {
+        "commented"
+    } else {
+        "reviewed"
     }
 }
 
@@ -1531,12 +1902,22 @@ fn run_agent(
     let command = settings.agent_command.as_ref().ok_or_else(|| {
         "uvx brokk acp is required for write runs but uvx was not found. Install uv or set VALKYRIE_AGENT_COMMAND/agent.command to an ACP agent command.".to_string()
     })?;
+    let prompt = render_agent_prompt(parsed, settings, target_context, plan);
+    invoke_acp_agent(repo, run_dir, parsed.target.kind(), command, &prompt)
+}
+
+fn invoke_acp_agent(
+    repo: &Path,
+    run_dir: &Path,
+    target_kind: &str,
+    command: &Resolved<String>,
+    prompt: &str,
+) -> Result<AgentRunReport, String> {
     if command.value != "uvx brokk acp" {
         return Err("custom agent.command values are not supported yet; Valkyrie currently runs the default ACP command `uvx brokk acp`.".to_string());
     }
-    let prompt = render_agent_prompt(parsed, settings, target_context, plan);
-    write_text(run_dir.join("agent-prompt.md"), &prompt)?;
-    let runner = write_acp_runner(run_dir, repo, parsed, &prompt, &command.value)?;
+    write_text(run_dir.join("agent-prompt.md"), prompt)?;
+    let runner = write_acp_runner(run_dir, repo, target_kind, prompt, &command.value)?;
     append_event(
         run_dir,
         &format!(
@@ -1550,7 +1931,7 @@ fn run_agent(
         .arg(&runner)
         .current_dir(repo)
         .env("VALKYRIE_RUN_DIR", run_dir)
-        .env("VALKYRIE_TARGET_KIND", parsed.target.kind())
+        .env("VALKYRIE_TARGET_KIND", target_kind)
         .output()
         .map_err(|error| format!("cannot start ACP client for `{}`: {error}", command.value))?;
 
@@ -1590,7 +1971,7 @@ fn run_agent(
 fn render_acp_runner_script(
     run_dir: &Path,
     repo: &Path,
-    parsed: &ParsedRun,
+    target_kind: &str,
     prompt: &str,
     agent_command: &str,
 ) -> String {
@@ -1836,7 +2217,7 @@ if __name__ == "__main__":
         repo_json = json_string_literal(&repo.display().to_string()),
         run_dir_json = json_string_literal(&run_dir.display().to_string()),
         prompt_json = json_string_literal(prompt),
-        target_kind_json = json_string_literal(parsed.target.kind()),
+        target_kind_json = json_string_literal(target_kind),
         agent_command_json = json_string_literal(agent_command),
     )
 }
@@ -1844,11 +2225,11 @@ if __name__ == "__main__":
 fn write_acp_runner(
     run_dir: &Path,
     repo: &Path,
-    parsed: &ParsedRun,
+    target_kind: &str,
     prompt: &str,
     agent_command: &str,
 ) -> Result<PathBuf, String> {
-    let script = render_acp_runner_script(run_dir, repo, parsed, prompt, agent_command);
+    let script = render_acp_runner_script(run_dir, repo, target_kind, prompt, agent_command);
     let runner = run_dir.join("acp-runner.py");
     write_text(runner.clone(), &script)?;
     Ok(runner)
@@ -2058,6 +2439,20 @@ const GH_PR_VIEW_JSON_FIELDS: &str =
 fn gh_pr_view(number: &str, repo: &Path) -> Result<String, String> {
     let output = Command::new("gh")
         .args(["pr", "view", number, "--json", GH_PR_VIEW_JSON_FIELDS])
+        .current_dir(repo)
+        .output()
+        .map_err(|error| format!("cannot run gh: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn gh_pr_diff(number: &str, repo: &Path) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["pr", "diff", number])
         .current_dir(repo)
         .output()
         .map_err(|error| format!("cannot run gh: {error}"))?;
@@ -2331,7 +2726,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>] [--post-comment]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -2703,5 +3098,245 @@ mod tests {
         let report = ValidationReport::skipped();
         assert!(!report.failed());
         assert!(report.to_markdown().contains("Validation was skipped"));
+    }
+
+    #[test]
+    fn review_decision_parses_known_values_and_rejects_unknown() {
+        assert_eq!(
+            ReviewDecision::parse("comment").unwrap(),
+            ReviewDecision::Comment
+        );
+        assert_eq!(
+            ReviewDecision::parse("APPROVE").unwrap(),
+            ReviewDecision::Approve
+        );
+        assert_eq!(
+            ReviewDecision::parse("request-changes").unwrap(),
+            ReviewDecision::RequestChanges
+        );
+        assert_eq!(
+            ReviewDecision::parse("request_changes").unwrap(),
+            ReviewDecision::RequestChanges
+        );
+        assert!(ReviewDecision::parse("merge").is_err());
+    }
+
+    #[test]
+    fn review_decision_maps_to_gh_flags() {
+        assert_eq!(ReviewDecision::Comment.gh_flag(), "--comment");
+        assert_eq!(ReviewDecision::Approve.gh_flag(), "--approve");
+        assert_eq!(
+            ReviewDecision::RequestChanges.gh_flag(),
+            "--request-changes"
+        );
+    }
+
+    #[test]
+    fn parsed_review_defaults_to_local_comment_review() {
+        let parsed = ParsedReview::parse(vec!["456".to_string()]).unwrap();
+
+        assert_eq!(parsed.number, "456");
+        assert_eq!(parsed.repo, PathBuf::from("."));
+        assert!(!parsed.plan_only);
+        assert!(!parsed.post_comment);
+        assert_eq!(parsed.decision, ReviewDecision::Comment);
+        assert!(!parsed.json);
+        assert!(!parsed.verbose);
+    }
+
+    #[test]
+    fn parsed_review_captures_flags_and_decision_shortcuts() {
+        let parsed = ParsedReview::parse(vec![
+            "789".to_string(),
+            "--repo".to_string(),
+            ".".to_string(),
+            "--request-changes".to_string(),
+            "--post-comment".to_string(),
+            "--json".to_string(),
+            "--verbose".to_string(),
+            "--plan".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.number, "789");
+        assert_eq!(parsed.decision, ReviewDecision::RequestChanges);
+        assert!(parsed.post_comment);
+        assert!(parsed.json);
+        assert!(parsed.verbose);
+        assert!(parsed.plan_only);
+    }
+
+    #[test]
+    fn parsed_review_decision_flag_overrides_with_explicit_value() {
+        let parsed = ParsedReview::parse(vec![
+            "12".to_string(),
+            "--decision".to_string(),
+            "approve".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.decision, ReviewDecision::Approve);
+    }
+
+    #[test]
+    fn parsed_review_rejects_missing_number_and_extra_positional() {
+        assert!(ParsedReview::parse(Vec::new()).is_err());
+        assert!(
+            ParsedReview::parse(vec!["1".to_string(), "2".to_string()]).is_err(),
+            "a second positional argument must be rejected"
+        );
+        assert!(ParsedReview::parse(vec!["1".to_string(), "--unknown".to_string()]).is_err());
+        assert!(
+            ParsedReview::parse(vec!["1".to_string(), "--decision".to_string()]).is_err(),
+            "missing decision value must be rejected"
+        );
+    }
+
+    #[test]
+    fn render_review_plan_reflects_post_choice() {
+        let context = TargetContext {
+            problem_statement: "Fix GitHub PR #456".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: None,
+            warning: None,
+        };
+
+        let local = ParsedReview::parse(vec!["456".to_string()]).unwrap();
+        let plan = render_review_plan(&local, &context);
+        assert!(plan.contains("# Valkyrie PR Review Plan"));
+        assert!(plan.contains("Recommendation: `comment`"));
+        assert!(plan.contains("remote submission is disabled"));
+
+        let remote = ParsedReview::parse(vec![
+            "456".to_string(),
+            "--approve".to_string(),
+            "--post-comment".to_string(),
+        ])
+        .unwrap();
+        let plan = render_review_plan(&remote, &context);
+        assert!(plan.contains("Submit a `approve` review"));
+    }
+
+    #[test]
+    fn render_review_prompt_embeds_diff_and_review_path() {
+        let context = TargetContext {
+            problem_statement: "Fix GitHub PR #456".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: None,
+            warning: None,
+        };
+        let parsed = ParsedReview::parse(vec!["456".to_string()]).unwrap();
+
+        let prompt = render_review_prompt(
+            &parsed,
+            &context,
+            Some("diff --git a/foo b/foo\n+added"),
+            "review.md",
+        );
+        assert!(prompt.contains("read-only review"));
+        assert!(prompt.contains("```diff"));
+        assert!(prompt.contains("diff --git a/foo b/foo"));
+        assert!(prompt.contains("Write your review to `review.md`"));
+
+        let without_diff = render_review_prompt(&parsed, &context, None, "review.md");
+        assert!(without_diff.contains("diff could not be fetched automatically"));
+    }
+
+    #[test]
+    fn render_review_prompt_ignores_blank_diff() {
+        let context = TargetContext {
+            problem_statement: "Fix GitHub PR #1".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: None,
+            warning: None,
+        };
+        let parsed = ParsedReview::parse(vec!["1".to_string()]).unwrap();
+
+        let prompt = render_review_prompt(&parsed, &context, Some("   \n  \n"), "review.md");
+        assert!(!prompt.contains("```diff"));
+        assert!(prompt.contains("diff could not be fetched automatically"));
+    }
+
+    #[test]
+    fn render_review_prompt_uses_provided_review_path() {
+        let context = TargetContext {
+            problem_statement: "Fix GitHub PR #1".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: None,
+            warning: None,
+        };
+        let parsed = ParsedReview::parse(vec!["1".to_string()]).unwrap();
+
+        let prompt = render_review_prompt(
+            &parsed,
+            &context,
+            Some("diff"),
+            ".valkyrie/runs/run-1/review.md",
+        );
+        assert!(prompt.contains("Write your review to `.valkyrie/runs/run-1/review.md`"));
+    }
+
+    #[test]
+    fn render_review_plan_reflects_request_changes_decision() {
+        let context = TargetContext {
+            problem_statement: "Fix GitHub PR #99".to_string(),
+            summary: "PR context".to_string(),
+            metadata_json: None,
+            warning: None,
+        };
+        let parsed = ParsedReview::parse(vec![
+            "99".to_string(),
+            "--request-changes".to_string(),
+            "--post-comment".to_string(),
+        ])
+        .unwrap();
+
+        let plan = render_review_plan(&parsed, &context);
+        assert!(plan.contains("Recommendation: `request-changes`"));
+        assert!(plan.contains("Submit a `request-changes` review"));
+    }
+
+    #[test]
+    fn gh_pr_review_args_builds_expected_command_for_each_decision() {
+        assert_eq!(
+            gh_pr_review_args("456", ReviewDecision::Comment, "/tmp/review.md"),
+            vec![
+                "pr".to_string(),
+                "review".to_string(),
+                "456".to_string(),
+                "--comment".to_string(),
+                "--body-file".to_string(),
+                "/tmp/review.md".to_string(),
+            ]
+        );
+        assert_eq!(
+            gh_pr_review_args("7", ReviewDecision::Approve, "review.md")[3],
+            "--approve".to_string()
+        );
+        assert_eq!(
+            gh_pr_review_args("7", ReviewDecision::RequestChanges, "review.md")[3],
+            "--request-changes".to_string()
+        );
+    }
+
+    #[test]
+    fn review_state_handles_agent_and_post_outcomes() {
+        let posted = WriteActionOutcome::success("submitted review", String::new(), String::new());
+        let not_requested = WriteActionOutcome::skipped("not requested");
+        let failed_post =
+            WriteActionOutcome::failure("gh pr review failed", String::new(), String::new());
+
+        // Agent failure dominates regardless of the posting outcome.
+        assert_eq!(review_state(false, &not_requested), "failed");
+        assert_eq!(review_state(false, &posted), "failed");
+
+        // Successful agent without a remote post is a local review.
+        assert_eq!(review_state(true, &not_requested), "reviewed");
+
+        // Successful agent and successful post becomes a commented review.
+        assert_eq!(review_state(true, &posted), "commented");
+
+        // A failed post turns the whole run into a failure.
+        assert_eq!(review_state(true, &failed_post), "failed");
     }
 }
