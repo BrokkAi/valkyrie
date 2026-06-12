@@ -25,7 +25,6 @@ fn run() -> Result<(), String> {
     let command = args.remove(0);
     match command.as_str() {
         "issue" => command_issue(args),
-        "pr" => command_pr(args),
         "review" => command_review(args),
         "defaults" => command_defaults(args),
         "status" => command_show_artifact(args, "result.json"),
@@ -264,23 +263,6 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
     }
 
     let mut rewritten = vec!["issue".to_string(), args[0].clone()];
-    let mut plan_only = false;
-    for arg in args.into_iter().skip(1) {
-        if arg == "--plan" {
-            plan_only = true;
-        } else {
-            rewritten.push(arg);
-        }
-    }
-    execute_target_run(rewritten, plan_only)
-}
-
-fn command_pr(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: vk pr <number> [--repo <path>] [--plan]".to_string());
-    }
-
-    let mut rewritten = vec!["pr".to_string(), args[0].clone()];
     let mut plan_only = false;
     for arg in args.into_iter().skip(1) {
         if arg == "--plan" {
@@ -598,7 +580,7 @@ impl ParsedRun {
         }
 
         if task_parts.is_empty() {
-            return Err("usage: vk issue <number> | vk pr <number> [--repo <path>]".to_string());
+            return Err("usage: vk issue <number> [--repo <path>]".to_string());
         }
 
         Ok(Self {
@@ -629,10 +611,8 @@ impl Target {
     fn from_parts(parts: Vec<String>) -> Result<Self, String> {
         if parts.len() >= 2 && parts[0] == "issue" {
             Ok(Self::Issue(parts[1].clone()))
-        } else if parts.len() >= 2 && parts[0] == "pr" {
-            Ok(Self::PullRequest(parts[1].clone()))
         } else {
-            Err("usage: vk issue <number> | vk pr <number> [--repo <path>]".to_string())
+            Err("usage: vk issue <number> [--repo <path>]".to_string())
         }
     }
 
@@ -2649,7 +2629,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -2665,16 +2645,10 @@ mod tests {
     }
 
     #[test]
-    fn target_parses_pull_request_alias() {
-        let target = Target::from_parts(vec!["pr".to_string(), "456".to_string()]).unwrap();
-        assert_eq!(target.kind(), "github-pr");
-        assert_eq!(target.slug(), "pr-456");
-    }
-
-    #[test]
-    fn target_from_parts_rejects_unknown_aliases() {
+    fn target_from_parts_rejects_unknown_and_pr_aliases() {
         assert!(Target::from_parts(vec!["fix".to_string(), "parser".to_string()]).is_err());
         assert!(Target::from_parts(vec!["issue".to_string()]).is_err());
+        assert!(Target::from_parts(vec!["pr".to_string(), "456".to_string()]).is_err());
     }
 
     #[test]
@@ -2688,10 +2662,10 @@ mod tests {
     }
 
     #[test]
-    fn parsed_run_parse_captures_flags_and_pull_request_target() {
+    fn parsed_run_parse_captures_flags_and_issue_target() {
         let parsed = ParsedRun::parse(
             vec![
-                "pr".to_string(),
+                "issue".to_string(),
                 "456".to_string(),
                 "--repo".to_string(),
                 ".".to_string(),
@@ -2709,7 +2683,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(parsed.target, Target::PullRequest(ref number) if number == "456"));
+        assert!(matches!(parsed.target, Target::Issue(ref number) if number == "456"));
         assert_eq!(parsed.repo, PathBuf::from("."));
         assert_eq!(parsed.validations, vec!["cargo test".to_string()]);
         assert!(parsed.dry_run);

@@ -84,27 +84,26 @@ Expected behavior:
 8. Optionally open or update a PR.
 9. Post a summary back to the issue when requested.
 
-### Fix a pull request
+### Review a pull request
 
 ```bash
-valkyrie pr 456
+valkyrie review 456
 ```
 
 Plan-only form:
 
 ```bash
-valkyrie pr 456 --plan
+valkyrie review 456 --plan
 ```
 
 Expected behavior:
 
-1. Check out the PR branch.
-2. Read PR description, review comments, unresolved threads, and CI failures.
-3. Determine the requested work.
-4. Apply fixes.
-5. Run validation.
-6. Commit and optionally push changes.
-7. Post a summary comment explaining what changed when requested.
+1. Fetch the PR description, diff, comments, and review feedback.
+2. Ask the agent to analyze the change without modifying the working tree.
+3. Capture the review locally and submit it to GitHub.
+
+Automated PR fixing (checking out the PR branch and applying changes) is
+future work tracked under Milestone 4; there is no dedicated `pr` command yet.
 
 ### Sweep labeled issues
 
@@ -190,7 +189,7 @@ Expected behavior:
 
 ```bash
 valkyrie issue <number>
-valkyrie pr <number>
+valkyrie review <number>
 valkyrie ci --pr <number> [--fix]
 valkyrie sweep [filters]
 valkyrie patrol [repo]
@@ -215,11 +214,11 @@ valkyrie issue 123
 valkyrie issue 123 --plan
 valkyrie issue 123 --commit
 valkyrie issue 123 --commit --push --open-pr
-valkyrie pr 456
+valkyrie review 456
 valkyrie ci --pr 456 --fix
 valkyrie sweep --label ready-for-agent --max 5
 valkyrie patrol --label bug --max 5
-valkyrie pr 456 --plan
+valkyrie issue 123 --plan
 valkyrie attach latest
 valkyrie tui latest
 ```
@@ -694,7 +693,7 @@ The first useful version should support:
 
 1. Local repo execution.
 2. GitHub issue target.
-3. GitHub PR target.
+3. GitHub PR review target.
 4. anvil agent invocation.
 5. bifrost MCP/LSP context.
 6. CLI-provided validation commands.
@@ -709,7 +708,7 @@ MVP commands:
 
 ```bash
 valkyrie issue 123 --repo .
-valkyrie pr 456 --repo .
+valkyrie review 456 --repo .
 valkyrie issue 123 --plan --repo .
 valkyrie defaults set validation.command "cargo test"
 valkyrie status <run-id>
@@ -957,7 +956,7 @@ trait TuiController {
 
 1. Keep `valkyrie` as the working CLI name.
 2. Define the `Target`, `RunRecord`, and `EffectiveSettings` data models.
-3. Implement direct shortcuts like `valkyrie issue 123` and `valkyrie pr 456`.
+3. Implement the direct `valkyrie issue 123` shortcut.
 4. Implement CLI-managed defaults before any hand-authored YAML requirement.
 5. Add GitHub issue resolution.
 6. Wire anvil execution with bifrost context.
