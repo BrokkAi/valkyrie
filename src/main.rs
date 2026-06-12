@@ -24,8 +24,6 @@ fn run() -> Result<(), String> {
 
     let command = args.remove(0);
     match command.as_str() {
-        "run" => command_run(args, false),
-        "plan" => command_plan(args),
         "issue" => command_issue(args),
         "pr" => command_pr(args),
         "review" => command_review(args),
@@ -44,7 +42,7 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
+fn execute_target_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
     let parsed = ParsedRun::parse(args, plan_only)?;
     let repo = resolve_repo(&parsed.repo)?;
     let defaults = DefaultsResolver::load(&repo)?;
@@ -70,7 +68,6 @@ fn command_run(args: Vec<String>, plan_only: bool) -> Result<(), String> {
         let metadata_file = match &parsed.target {
             Target::Issue(_) => "issue.json",
             Target::PullRequest(_) => "pr.json",
-            Target::LocalTask(_) => "metadata.json",
         };
         write_text(run_dir.join(metadata_file), metadata_json)?;
     }
@@ -261,14 +258,6 @@ Planning completed. No files were modified by Valkyrie.
     Ok(())
 }
 
-fn command_plan(args: Vec<String>) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("usage: vk plan <task>|issue <number> [--repo <path>]".to_string());
-    }
-
-    command_run(rewrite_target_alias(args), true)
-}
-
 fn command_issue(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: vk issue <number> [--repo <path>] [--plan]".to_string());
@@ -283,7 +272,7 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
             rewritten.push(arg);
         }
     }
-    command_run(rewritten, plan_only)
+    execute_target_run(rewritten, plan_only)
 }
 
 fn command_pr(args: Vec<String>) -> Result<(), String> {
@@ -300,7 +289,7 @@ fn command_pr(args: Vec<String>) -> Result<(), String> {
             _ => rewritten.push(arg),
         }
     }
-    command_run(rewritten, plan_only)
+    execute_target_run(rewritten, plan_only)
 }
 
 fn command_review(args: Vec<String>) -> Result<(), String> {
@@ -611,11 +600,11 @@ impl ParsedRun {
         }
 
         if task_parts.is_empty() {
-            return Err("usage: vk run <task> [--repo <path>]".to_string());
+            return Err("usage: vk issue <number> | vk pr <number> [--repo <path>]".to_string());
         }
 
         Ok(Self {
-            target: Target::from_parts(task_parts),
+            target: Target::from_parts(task_parts)?,
             repo,
             dry_run,
             no_write,
@@ -634,25 +623,23 @@ impl ParsedRun {
 
 #[derive(Debug)]
 enum Target {
-    LocalTask(String),
     Issue(String),
     PullRequest(String),
 }
 
 impl Target {
-    fn from_parts(parts: Vec<String>) -> Self {
+    fn from_parts(parts: Vec<String>) -> Result<Self, String> {
         if parts.len() >= 2 && parts[0] == "issue" {
-            Self::Issue(parts[1].clone())
+            Ok(Self::Issue(parts[1].clone()))
         } else if parts.len() >= 2 && parts[0] == "pr" {
-            Self::PullRequest(parts[1].clone())
+            Ok(Self::PullRequest(parts[1].clone()))
         } else {
-            Self::LocalTask(parts.join(" "))
+            Err("usage: vk issue <number> | vk pr <number> [--repo <path>]".to_string())
         }
     }
 
     fn kind(&self) -> &'static str {
         match self {
-            Self::LocalTask(_) => "local-task",
             Self::Issue(_) => "github-issue",
             Self::PullRequest(_) => "github-pr",
         }
@@ -660,20 +647,9 @@ impl Target {
 
     fn slug(&self) -> String {
         match self {
-            Self::LocalTask(task) => slugify(task),
             Self::Issue(number) => format!("issue-{number}"),
             Self::PullRequest(number) => format!("pr-{number}"),
         }
-    }
-}
-
-fn rewrite_target_alias(args: Vec<String>) -> Vec<String> {
-    if args.len() >= 2 && (args[0] == "issue" || args[0] == "pr") {
-        let mut rewritten = vec![args[0].clone(), args[1].clone()];
-        rewritten.extend(args.into_iter().skip(2));
-        rewritten
-    } else {
-        args
     }
 }
 
@@ -1777,7 +1753,6 @@ fn target_comment_target(target: &Target) -> Option<(&'static str, &str)> {
     match target {
         Target::Issue(number) => Some(("issue", number)),
         Target::PullRequest(number) => Some(("pr", number)),
-        Target::LocalTask(_) => None,
     }
 }
 
@@ -1811,17 +1786,15 @@ fn render_pr_body(
     )
 }
 
-fn pr_title(target: &Target, target_context: &TargetContext) -> String {
+fn pr_title(target: &Target, _target_context: &TargetContext) -> String {
     match target {
         Target::Issue(number) => format!("Fix issue #{number}"),
         Target::PullRequest(number) => format!("Update PR #{number}"),
-        Target::LocalTask(_) => target_context.problem_statement.clone(),
     }
 }
 
 fn commit_message(target: &Target) -> String {
     match target {
-        Target::LocalTask(task) => format!("Apply Valkyrie task: {}", first_line(task)),
         Target::Issue(number) => format!("Fix issue #{number}"),
         Target::PullRequest(number) => format!("Update PR #{number}"),
     }
@@ -1829,14 +1802,9 @@ fn commit_message(target: &Target) -> String {
 
 fn target_label(target: &Target) -> String {
     match target {
-        Target::LocalTask(task) => format!("local task `{}`", first_line(task)),
         Target::Issue(number) => format!("GitHub issue #{number}"),
         Target::PullRequest(number) => format!("GitHub PR #{number}"),
     }
-}
-
-fn first_line(value: &str) -> &str {
-    value.lines().next().unwrap_or(value)
 }
 
 fn ensure_clean_worktree(repo: &Path) -> Result<(), String> {
@@ -2252,7 +2220,6 @@ fn render_agent_prompt(
             .join("\n")
     };
     let target = match &parsed.target {
-        Target::LocalTask(task) => format!("local task: {task}"),
         Target::Issue(number) => format!("GitHub issue #{number}"),
         Target::PullRequest(number) => format!("GitHub pull request #{number}"),
     };
@@ -2330,12 +2297,6 @@ impl TargetContext {
 
 fn resolve_target_context(target: &Target, repo: &Path) -> TargetContext {
     match target {
-        Target::LocalTask(task) => TargetContext {
-            problem_statement: task.clone(),
-            summary: "Local repository task provided directly on the CLI.".to_string(),
-            metadata_json: None,
-            warning: None,
-        },
         Target::Issue(number) => resolve_issue_context(number, repo),
         Target::PullRequest(number) => resolve_pr_context(number, repo),
     }
@@ -2517,12 +2478,6 @@ fn render_plan(
 
 fn render_target_json(target: &Target, repo: &Path) -> String {
     match target {
-        Target::LocalTask(task) => format!(
-            "{{\n  \"kind\": \"{}\",\n  \"task\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
-            target.kind(),
-            escape_json(task),
-            escape_json(&repo.display().to_string())
-        ),
         Target::Issue(number) => format!(
             "{{\n  \"kind\": \"{}\",\n  \"number\": \"{}\",\n  \"repo\": \"{}\"\n}}\n",
             target.kind(),
@@ -2562,23 +2517,6 @@ fn make_run_id(slug: &str) -> String {
     } else {
         format!("{seconds}-{slug}")
     }
-}
-
-fn slugify(input: &str) -> String {
-    input
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() {
-                char.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .chars()
-        .take(40)
-        .collect()
 }
 
 fn current_repo() -> Result<PathBuf, String> {
@@ -2726,7 +2664,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>] [--post-comment]\n  valkyrie run <task> [--repo <path>] [--validate <command>] [--no-write|--write] [--skip-validation] [--json] [--verbose]\n  valkyrie plan <task>|issue <number>|pr <number> [--repo <path>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie pr <number> [--repo <path>] [--fix] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>] [--post-comment]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
@@ -2735,62 +2673,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slugify_limits_and_normalizes() {
-        assert_eq!(slugify("Fix the Parser Panic!"), "fix-the-parser-panic");
-        assert_eq!(slugify("---"), "");
-    }
-
-    #[test]
-    fn target_parses_local_task_when_no_known_alias_is_present() {
-        let target = Target::from_parts(vec!["fix".to_string(), "parser".to_string()]);
-        assert_eq!(target.kind(), "local-task");
-        assert_eq!(target.slug(), "fix-parser");
-    }
-
-    #[test]
-    fn rewrite_target_alias_leaves_local_tasks_unchanged() {
-        let args = vec![
-            "fix".to_string(),
-            "parser".to_string(),
-            "--repo".to_string(),
-            ".".to_string(),
-        ];
-
-        assert_eq!(rewrite_target_alias(args.clone()), args);
-    }
-
-    #[test]
     fn target_parses_issue_alias() {
-        let target = Target::from_parts(vec!["issue".to_string(), "123".to_string()]);
+        let target = Target::from_parts(vec!["issue".to_string(), "123".to_string()]).unwrap();
         assert_eq!(target.kind(), "github-issue");
         assert_eq!(target.slug(), "issue-123");
     }
 
     #[test]
     fn target_parses_pull_request_alias() {
-        let target = Target::from_parts(vec!["pr".to_string(), "456".to_string()]);
+        let target = Target::from_parts(vec!["pr".to_string(), "456".to_string()]).unwrap();
         assert_eq!(target.kind(), "github-pr");
         assert_eq!(target.slug(), "pr-456");
     }
 
     #[test]
-    fn rewrite_target_alias_preserves_pull_request_target() {
-        let rewritten = rewrite_target_alias(vec![
-            "pr".to_string(),
-            "456".to_string(),
-            "--repo".to_string(),
-            ".".to_string(),
-        ]);
-
-        assert_eq!(
-            rewritten,
-            vec![
-                "pr".to_string(),
-                "456".to_string(),
-                "--repo".to_string(),
-                ".".to_string(),
-            ]
-        );
+    fn target_from_parts_rejects_unknown_aliases() {
+        assert!(Target::from_parts(vec!["fix".to_string(), "parser".to_string()]).is_err());
+        assert!(Target::from_parts(vec!["issue".to_string()]).is_err());
     }
 
     #[test]
@@ -2838,12 +2737,27 @@ mod tests {
     }
 
     #[test]
-    fn parsed_run_parse_rejects_missing_task_unknown_flag_and_missing_flag_value() {
+    fn parsed_run_parse_rejects_missing_target_unknown_flag_and_missing_flag_value() {
         assert!(ParsedRun::parse(Vec::new(), false).is_err());
         assert!(
-            ParsedRun::parse(vec!["task".to_string(), "--unknown".to_string()], false).is_err()
+            ParsedRun::parse(
+                vec![
+                    "issue".to_string(),
+                    "1".to_string(),
+                    "--unknown".to_string()
+                ],
+                false
+            )
+            .is_err()
         );
-        assert!(ParsedRun::parse(vec!["task".to_string(), "--repo".to_string()], false).is_err());
+        assert!(
+            ParsedRun::parse(
+                vec!["issue".to_string(), "1".to_string(), "--repo".to_string()],
+                false
+            )
+            .is_err()
+        );
+        assert!(ParsedRun::parse(vec!["fix".to_string(), "parser".to_string()], false).is_err());
     }
 
     #[test]
@@ -2903,22 +2817,48 @@ mod tests {
             user: DefaultsStore::default(),
         };
 
-        let mut parsed =
-            ParsedRun::parse(vec!["task".to_string(), "--no-write".to_string()], false).unwrap();
+        let mut parsed = ParsedRun::parse(
+            vec![
+                "issue".to_string(),
+                "123".to_string(),
+                "--no-write".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
         let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
         assert_eq!(settings.write_mode, WriteMode::NoWrite);
         assert_eq!(settings.write_mode_source, "cli");
 
-        parsed = ParsedRun::parse(vec!["task".to_string(), "--commit".to_string()], false).unwrap();
+        parsed = ParsedRun::parse(
+            vec![
+                "issue".to_string(),
+                "123".to_string(),
+                "--commit".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
         let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
         assert_eq!(settings.write_mode, WriteMode::Commit);
 
-        parsed = ParsedRun::parse(vec!["task".to_string(), "--push".to_string()], false).unwrap();
+        parsed = ParsedRun::parse(
+            vec!["issue".to_string(), "123".to_string(), "--push".to_string()],
+            false,
+        )
+        .unwrap();
         let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
         assert_eq!(settings.write_mode, WriteMode::Push);
 
-        parsed =
-            ParsedRun::parse(vec!["task".to_string(), "--open-pr".to_string()], false).unwrap();
+        parsed = ParsedRun::parse(
+            vec![
+                "issue".to_string(),
+                "123".to_string(),
+                "--open-pr".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
         let settings = EffectiveSettings::from_inputs(&parsed, &defaults);
         assert_eq!(settings.write_mode, WriteMode::Pr);
     }
@@ -3032,11 +2972,9 @@ mod tests {
     fn target_comment_target_supports_only_remote_targets() {
         let issue = Target::Issue("12".to_string());
         let pr = Target::PullRequest("34".to_string());
-        let local = Target::LocalTask("fix docs".to_string());
 
         assert_eq!(target_comment_target(&issue), Some(("issue", "12")));
         assert_eq!(target_comment_target(&pr), Some(("pr", "34")));
-        assert_eq!(target_comment_target(&local), None);
     }
 
     #[test]

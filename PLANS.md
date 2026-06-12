@@ -2,7 +2,7 @@
 
 ## Summary
 
-**Valkyrie** is an automation CLI for running agentic workloads against software repositories. It should be able to take a GitHub issue, pull request, label, branch, CI failure, or local repo task and autonomously plan, execute, validate, and report on code changes.
+**Valkyrie** is an automation CLI for running agentic workloads against software repositories. It should be able to take a GitHub issue, pull request, label, branch, or CI failure and autonomously plan, execute, validate, and report on code changes.
 
 The CLI sits above the existing agentic stack:
 
@@ -53,7 +53,7 @@ A config file should be something Valkyrie can generate, explain, edit, and migr
 1. Valkyrie is not a general-purpose chat UI.
 2. Valkyrie is not a replacement for mjolnir or brokk.
 3. Valkyrie should not hide agent decisions; runs must be inspectable.
-4. Valkyrie should not require a GitHub dependency for local-only operation.
+4. Valkyrie should not require remote GitHub access just to inspect or plan against a local checkout, but every target must still be a concrete trigger (issue, PR, CI failure, branch) rather than a free-form prose task.
 5. Valkyrie should not directly implement deep code intelligence that belongs in bifrost.
 6. Valkyrie should not require users to hand-author YAML before they can run useful workloads.
 7. Valkyrie should not become a configuration-file-driven workflow engine where the CLI is just a thin wrapper around YAML.
@@ -66,10 +66,10 @@ A config file should be something Valkyrie can generate, explain, edit, and migr
 valkyrie issue 123
 ```
 
-Equivalent explicit form:
+Plan-only form:
 
 ```bash
-valkyrie run issue 123
+valkyrie issue 123 --plan
 ```
 
 Expected behavior:
@@ -141,15 +141,21 @@ Expected behavior:
 4. Re-run targeted tests locally if possible.
 5. Push fixes or leave a local patch based on explicit write mode.
 
-### Local task execution
+### Local execution
+
+Valkyrie always operates on a local repository checkout, even for GitHub
+targets. A target still has to be a concrete trigger (issue, PR, and later CI
+failures or branch diffs); Valkyrie does not accept free-form prose tasks,
+because interactive "do this for me" prompting is the role of the agent clients
+(anvil, mjolnir, brokk) rather than the automation CLI.
 
 ```bash
-valkyrie run "upgrade the parser tests for the new syntax"
+valkyrie issue 123 --plan
 ```
 
 Expected behavior:
 
-1. Run entirely from local repository context.
+1. Resolve the target from local repository context plus GitHub metadata.
 2. Use bifrost for code navigation and semantic context.
 3. Produce a plan, diff, and validation summary.
 4. Avoid remote writes unless explicitly requested.
@@ -186,10 +192,8 @@ Expected behavior:
 valkyrie issue <number>
 valkyrie pr <number> [--fix]
 valkyrie ci --pr <number> [--fix]
-valkyrie run <task>
 valkyrie sweep [filters]
 valkyrie patrol [repo]
-valkyrie plan <target>
 valkyrie status [run-id]
 valkyrie logs <run-id>
 valkyrie diff <run-id>
@@ -211,12 +215,11 @@ valkyrie issue 123
 valkyrie issue 123 --plan
 valkyrie issue 123 --commit
 valkyrie issue 123 --commit --push --open-pr
-valkyrie run gh:owner/repo#123
 valkyrie pr 456 --fix
 valkyrie ci --pr 456 --fix
 valkyrie sweep --label ready-for-agent --max 5
 valkyrie patrol --label bug --max 5
-valkyrie plan issue 123 --no-write
+valkyrie pr 456 --plan
 valkyrie attach latest
 valkyrie tui latest
 ```
@@ -573,7 +576,7 @@ Outputs:
 Planning and analysis only. No file changes.
 
 ```bash
-valkyrie plan issue 123
+valkyrie issue 123 --plan
 ```
 
 ### local-patch
@@ -707,8 +710,7 @@ MVP commands:
 ```bash
 valkyrie issue 123 --repo .
 valkyrie pr 456 --fix --repo .
-valkyrie run "fix the parser panic" --repo .
-valkyrie plan issue 123 --repo .
+valkyrie issue 123 --plan --repo .
 valkyrie defaults set validation.command "cargo test"
 valkyrie status <run-id>
 valkyrie logs <run-id>
@@ -718,7 +720,7 @@ valkyrie attach <run-id>
 
 ## Milestones
 
-### Milestone 1: Local task runner
+### Milestone 1: Local target runner
 
 Status: [~] In progress
 
@@ -955,14 +957,13 @@ trait TuiController {
 
 1. Keep `valkyrie` as the working CLI name.
 2. Define the `Target`, `RunRecord`, and `EffectiveSettings` data models.
-3. Implement `valkyrie run` for local-only tasks.
-4. Implement direct shortcuts like `valkyrie issue 123` and `valkyrie pr 456 --fix`.
-5. Implement CLI-managed defaults before any hand-authored YAML requirement.
-6. Add GitHub issue resolution.
-7. Wire anvil execution with bifrost context.
-8. Persist run artifacts.
-9. Add validation command execution.
-10. Add basic TUI attach/inspect.
-11. Add commit support.
-12. Add PR creation and commenting behind explicit flags.
+3. Implement direct shortcuts like `valkyrie issue 123` and `valkyrie pr 456 --fix`.
+4. Implement CLI-managed defaults before any hand-authored YAML requirement.
+5. Add GitHub issue resolution.
+6. Wire anvil execution with bifrost context.
+7. Persist run artifacts.
+8. Add validation command execution.
+9. Add basic TUI attach/inspect.
+10. Add commit support.
+11. Add PR creation and commenting behind explicit flags.
 
