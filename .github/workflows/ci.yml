@@ -2,31 +2,92 @@ name: CI
 
 on:
   push:
-    branches:
-      - master
+    branches: [ 'master', 'ci/**' ]
   pull_request:
+    branches: [ 'master' ]
 
 permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust checks
-    runs-on: ubuntu-latest
+  build:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
 
-      - name: Check formatting
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run Clippy lints
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
+
+      - name: Verify crate package
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: cargo publish --dry-run --locked
+
+  build-android:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: sdkmanager "ndk;29.0.13113456"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: android-aarch64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            android-aarch64-cargo-
+
+      - name: Build Android release binary
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
+          CC_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CXX_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+          AR_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build --release --locked --target aarch64-linux-android
