@@ -87,13 +87,13 @@ Expected behavior:
 ### Review a pull request
 
 ```bash
-valkyrie review 456
+valkyrie pr 456
 ```
 
 Plan-only form:
 
 ```bash
-valkyrie review 456 --plan
+valkyrie pr 456 --plan
 ```
 
 Expected behavior:
@@ -103,7 +103,7 @@ Expected behavior:
 3. Capture the review locally and submit it to GitHub.
 
 Automated PR fixing (checking out the PR branch and applying changes) is
-future work tracked under Milestone 4; there is no dedicated `pr` command yet.
+future work tracked under Milestone 4.
 
 ### Sweep labeled issues
 
@@ -189,7 +189,7 @@ Expected behavior:
 
 ```bash
 valkyrie issue <number>
-valkyrie review <number>
+valkyrie pr <number>
 valkyrie ci --pr <number> [--fix]
 valkyrie sweep [filters]
 valkyrie patrol [repo]
@@ -214,7 +214,7 @@ valkyrie issue 123
 valkyrie issue 123 --plan
 valkyrie issue 123 --commit
 valkyrie issue 123 --commit --push --open-pr
-valkyrie review 456
+valkyrie pr 456
 valkyrie ci --pr 456 --fix
 valkyrie sweep --label ready-for-agent --max 5
 valkyrie patrol --label bug --max 5
@@ -708,7 +708,7 @@ MVP commands:
 
 ```bash
 valkyrie issue 123 --repo .
-valkyrie review 456 --repo .
+valkyrie pr 456 --repo .
 valkyrie issue 123 --plan --repo .
 valkyrie defaults set validation.command "cargo test"
 valkyrie status <run-id>

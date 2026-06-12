@@ -25,7 +25,7 @@ fn run() -> Result<(), String> {
     let command = args.remove(0);
     match command.as_str() {
         "issue" => command_issue(args),
-        "review" => command_review(args),
+        "pr" => command_pr(args),
         "defaults" => command_defaults(args),
         "status" => command_show_artifact(args, "result.json"),
         "logs" => command_show_artifact(args, "events.jsonl"),
@@ -274,7 +274,7 @@ fn command_issue(args: Vec<String>) -> Result<(), String> {
     execute_target_run(rewritten, plan_only)
 }
 
-fn command_review(args: Vec<String>) -> Result<(), String> {
+fn command_pr(args: Vec<String>) -> Result<(), String> {
     let parsed = ParsedReview::parse(args)?;
     let repo = resolve_repo(&parsed.repo)?;
     let target_context = resolve_pr_context(&parsed.number, &repo);
@@ -711,8 +711,8 @@ impl ParsedReview {
             }
         }
 
-        let number = number
-            .ok_or_else(|| "usage: vk review <number> [--repo <path>] [--plan]".to_string())?;
+        let number =
+            number.ok_or_else(|| "usage: vk pr <number> [--repo <path>] [--plan]".to_string())?;
 
         Ok(Self {
             number,
@@ -2629,7 +2629,7 @@ fn infer_validation_command() -> String {
 
 fn print_help() {
     println!(
-        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie review <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
+        "Valkyrie automation CLI\n\nUsage:\n  valkyrie issue <number> [--repo <path>] [--plan] [--validate <command>] [--no-write|--write] [--commit] [--push] [--open-pr] [--post-comment] [--skip-validation] [--json] [--verbose]\n  valkyrie pr <number> [--repo <path>] [--plan] [--decision <comment|approve|request-changes>]\n  vk defaults [--repo <path>] [--global] get [key]\n  vk defaults [--repo <path>] [--global] set <key> <value>\n  vk defaults [--repo <path>] [--global] unset <key>\n  vk defaults [--repo <path>] [--global] export\n  valkyrie status <run-id|latest>\n  valkyrie logs <run-id|latest>\n  valkyrie diff <run-id|latest>\n  valkyrie doctor\n\nDefaults precedence for runs: CLI flags > environment variables > repo defaults > user defaults > built-in defaults. Remote writes stay disabled unless explicitly requested."
     );
 }
 
