@@ -1,93 +1,305 @@
-name: Release
+name: GitHub Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }} release artifact
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: vk-linux-x86_64
-            binary_path: target/x86_64-unknown-linux-gnu/release/vk
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: vk-macos-aarch64
-            binary_path: target/aarch64-apple-darwin/release/vk
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: vk-windows-x86_64.exe
-            binary_path: target/x86_64-pc-windows-msvc/release/vk.exe
-          - os: ubuntu-latest
-            target: aarch64-linux-android
-            artifact_name: vk-android-aarch64
-            binary_path: target/aarch64-linux-android/release/vk
-            android: true
-    runs-on: ${{ matrix.os }}
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Setup Android NDK
-        if: matrix.android == true
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27d
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
 
-      - name: Export Android NDK toolchain
-        if: matrix.android == true
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
         shell: bash
         run: |
-          ndk_path='${{ steps.setup-ndk.outputs.ndk-path }}'
-          echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ndk_path" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=$ndk_path/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-      - name: Copy artifact
+      - name: Package archive
         shell: bash
-        run: cp "${{ matrix.binary_path }}" "${{ matrix.artifact_name }}"
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-valkryie-${ref}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/x86_64-unknown-linux-gnu/release/vk" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: x86_64-unknown-linux-gnu
+          path: |
+            brokk-valkryie-*.zip
+            brokk-valkryie-*.zip.sha256
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub release
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+  build-linux-arm64:
+    name: Build aarch64-unknown-linux-gnu
+    runs-on: ubuntu-24.04-arm
     steps:
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          path: dist
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-valkryie-${ref}-aarch64-unknown-linux-gnu"
+          mkdir "$name"
+          cp "target/aarch64-unknown-linux-gnu/release/vk" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-unknown-linux-gnu
+          path: |
+            brokk-valkryie-*.zip
+            brokk-valkryie-*.zip.sha256
+          if-no-files-found: error
+
+  build-android-arm64:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: sdkmanager "ndk;29.0.13113456"
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456
+          CC_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          CXX_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++
+          AR_aarch64_linux_android: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_SDK_ROOT }}/ndk/29.0.13113456/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+        run: cargo build --release --locked --target aarch64-linux-android
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-valkryie-${ref}-aarch64-linux-android"
+          mkdir "$name"
+          cp "target/aarch64-linux-android/release/vk" "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-linux-android
+          path: |
+            brokk-valkryie-*.zip
+            brokk-valkryie-*.zip.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME -replace '/', '-'
+          $name = "brokk-valkryie-$ref-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\vk.exe" -Destination $name
+          Copy-Item "README.md" -Destination $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Path "$name.zip.sha256" -NoNewline
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: x86_64-pc-windows-msvc
+          path: |
+            brokk-valkryie-*.zip
+            brokk-valkryie-*.zip.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build universal-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$EXPECTED_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($EXPECTED_VERSION) does not match Cargo.toml version ($CARGO_VERSION). Bump Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Tag and Cargo.toml versions match: $CARGO_VERSION"
+
+      - name: Build x86_64 binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build aarch64 binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/vk \
+            target/aarch64-apple-darwin/release/vk \
+            -output target/universal-apple-darwin/release/vk
+          lipo -info target/universal-apple-darwin/release/vk
+
+      - name: Package archive
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="brokk-valkryie-${ref}-universal-apple-darwin"
+          mkdir "$name"
+          cp target/universal-apple-darwin/release/vk "$name/"
+          cp README.md "$name/"
+          zip -r "$name.zip" "$name"
+          shasum -a 256 "$name.zip" > "$name.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: universal-apple-darwin
+          path: |
+            brokk-valkryie-*.zip
+            brokk-valkryie-*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    if: github.event_name == 'push'
+    needs:
+      - build-linux
+      - build-linux-arm64
+      - build-android-arm64
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
           merge-multiple: true
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: artifacts/*
