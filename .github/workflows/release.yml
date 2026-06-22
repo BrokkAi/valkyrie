@@ -9,12 +9,20 @@ on:
 permissions:
   contents: write
 
+# Harden cargo's network layer against transient crates.io index fetches that
+# intermittently abort the release with `[16] Error in the HTTP2 framing layer`
+# while curl pulls the sparse index over HTTP/2. Forcing HTTP/1.1 sidesteps the
+# multiplexing bug and the retry bump rides out brief CDN blips.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   build-linux:
     name: Build x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,7 +72,7 @@ jobs:
     name: Build aarch64-unknown-linux-gnu
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -114,7 +122,7 @@ jobs:
     name: Build aarch64-linux-android
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -122,7 +130,7 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Install Android SDK + NDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android NDK
         shell: bash
@@ -177,7 +185,7 @@ jobs:
     name: Build x86_64-pc-windows-msvc
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -225,7 +233,7 @@ jobs:
     name: Build universal-apple-darwin
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -283,15 +291,10 @@ jobs:
   release:
     name: Create GitHub Release
     if: github.event_name == 'push'
-    needs:
-      - build-linux
-      - build-linux-arm64
-      - build-android-arm64
-      - build-windows
-      - build-macos
+    needs: [build-linux, build-linux-arm64, build-android-arm64, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -300,6 +303,9 @@ jobs:
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          files: artifacts/*
+          generate_release_notes: true
+          files: |
+            artifacts/brokk-valkryie-*.zip
+            artifacts/brokk-valkryie-*.zip.sha256
