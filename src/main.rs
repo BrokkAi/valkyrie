@@ -99,6 +99,10 @@ struct WatchArgs {
     #[arg(long)]
     show_anvil_logs: bool,
 
+    /// Ask Anvil to fix failed PR checks/statuses. This may modify and push code.
+    #[arg(long)]
+    auto_fix_status: bool,
+
     /// Show per-repository polling summaries.
     #[arg(short, long)]
     verbose: bool,
@@ -225,7 +229,73 @@ fn poll_repository(
     let pulls = github.open_pull_requests(repository, args.limit)?;
     let mut skipped_recorded = 0;
     let mut skipped_existing_review = 0;
+    let mut skipped_fix_attempted = 0;
     for pull in pulls {
+        if args.auto_fix_status {
+            let status = github.pull_request_status(repository, &pull.head.sha)?;
+            if status.is_failing() {
+                let state_key = fix_state_key(repository, pull.number, &pull.head.sha);
+                if state.fix_attempts.contains_key(&state_key) {
+                    skipped_fix_attempted += 1;
+                } else if args.dry_run {
+                    println!(
+                        "dry run: would ask Anvil to fix status for {repository}#{} ({})",
+                        pull.number,
+                        status.summary()
+                    );
+                } else {
+                    let Some(head_repo) = pull.head.repo.as_ref() else {
+                        println!(
+                            "skipping status fix for {repository}#{} because the pull request head repository is unavailable",
+                            pull.number
+                        );
+                        continue;
+                    };
+                    ensure_clean_worktree()?;
+                    let local_head = git_head_sha()?;
+                    if local_head != pull.head.sha {
+                        println!(
+                            "skipping status fix for {repository}#{} because local HEAD {local_head} does not match PR head {}",
+                            pull.number, pull.head.sha
+                        );
+                        continue;
+                    }
+                    println!(
+                        "fixing status for {repository}#{} with Anvil ({})",
+                        pull.number,
+                        status.summary()
+                    );
+                    let prompt = build_status_fix_prompt(repository, &pull, &status);
+                    let anvil = AnvilOptions {
+                        binary: args.anvil_binary.clone(),
+                        default_model: args.default_model.clone(),
+                        max_turns: args.max_turns,
+                        show_logs: args.show_anvil_logs,
+                        permission_mode: "default",
+                        write_files: true,
+                        terminal: true,
+                    };
+                    let original_head = local_head;
+                    anvil_run(&anvil, &prompt)?;
+                    if commit_and_push_status_fix(repository, &pull, head_repo, &original_head)? {
+                        println!("pushed status fix for {repository}#{}", pull.number);
+                    } else {
+                        println!(
+                            "Anvil did not leave local changes for {repository}#{}",
+                            pull.number
+                        );
+                    }
+                    state.record_fix_attempt(repository, &pull, &status);
+                    state.save(state_path)?;
+                    println!(
+                        "finished status fix attempt for {repository}#{}",
+                        pull.number
+                    );
+                    continue;
+                }
+            }
+        }
+
         let state_key = review_state_key(repository, pull.number);
         if state.reviews.contains_key(&state_key) {
             skipped_recorded += 1;
@@ -257,6 +327,9 @@ fn poll_repository(
             default_model: args.default_model.clone(),
             max_turns: args.max_turns,
             show_logs: args.show_anvil_logs,
+            permission_mode: "readOnly",
+            write_files: false,
+            terminal: false,
         };
         let generated = anvil_review(&anvil, &prompt)?;
         let review = sanitize_generated_review(generated, &files)?;
@@ -268,8 +341,8 @@ fn poll_repository(
 
     if args.verbose {
         println!(
-            "polled {repository}: {} already recorded, {} existing Valkyrie review(s)",
-            skipped_recorded, skipped_existing_review
+            "polled {repository}: {} already recorded, {} existing Valkyrie review(s), {} previous status fix attempt(s)",
+            skipped_recorded, skipped_existing_review, skipped_fix_attempted
         );
     }
     Ok(())
@@ -326,6 +399,12 @@ struct PullRequestHead {
     sha: String,
     #[serde(rename = "ref")]
     branch: String,
+    repo: Option<PullRequestHeadRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestHeadRepo {
+    full_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +414,72 @@ struct PullRequestFile {
     additions: u64,
     deletions: u64,
     patch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CombinedStatus {
+    state: String,
+    #[serde(default)]
+    statuses: Vec<CommitStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitStatus {
+    state: String,
+    context: String,
+    description: Option<String>,
+    target_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRunsResponse {
+    #[serde(default)]
+    check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckRun {
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PullRequestStatus {
+    failed_contexts: Vec<FailedContext>,
+    pending_contexts: Vec<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FailedContext {
+    name: String,
+    kind: StatusContextKind,
+    detail: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StatusContextKind {
+    CommitStatus,
+    CheckRun,
+}
+
+impl PullRequestStatus {
+    fn is_failing(&self) -> bool {
+        !self.failed_contexts.is_empty()
+    }
+
+    fn summary(&self) -> String {
+        let failed = self.failed_contexts.len();
+        let pending = self.pending_contexts.len();
+        match (failed, pending) {
+            (1, 0) => "1 failing context".to_string(),
+            (1, _) => format!("1 failing context, {pending} pending"),
+            (_, 0) => format!("{failed} failing contexts"),
+            _ => format!("{failed} failing contexts, {pending} pending"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +530,40 @@ impl GitHubClient {
     ) -> Result<Vec<PullRequestFile>, String> {
         let endpoint = format!(
             "/repos/{}/{}/pulls/{number}/files?per_page=100",
+            repository.owner, repository.name
+        );
+        self.get(&endpoint)
+    }
+
+    fn pull_request_status(
+        &self,
+        repository: &RepoSlug,
+        head_sha: &str,
+    ) -> Result<PullRequestStatus, String> {
+        let combined = self.commit_status(repository, head_sha)?;
+        let check_runs = self.check_runs(repository, head_sha)?;
+        Ok(classify_pull_request_status(combined, check_runs))
+    }
+
+    fn commit_status(
+        &self,
+        repository: &RepoSlug,
+        head_sha: &str,
+    ) -> Result<CombinedStatus, String> {
+        let endpoint = format!(
+            "/repos/{}/{}/commits/{head_sha}/status",
+            repository.owner, repository.name
+        );
+        self.get(&endpoint)
+    }
+
+    fn check_runs(
+        &self,
+        repository: &RepoSlug,
+        head_sha: &str,
+    ) -> Result<CheckRunsResponse, String> {
+        let endpoint = format!(
+            "/repos/{}/{}/commits/{head_sha}/check-runs?per_page=100",
             repository.owner, repository.name
         );
         self.get(&endpoint)
@@ -502,7 +681,10 @@ fn repository_access_error(repository: &RepoSlug, error: &str) -> String {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ReviewState {
+    #[serde(default)]
     reviews: BTreeMap<String, RecordedReview>,
+    #[serde(default)]
+    fix_attempts: BTreeMap<String, RecordedFixAttempt>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -512,6 +694,15 @@ struct RecordedReview {
     head_sha: String,
     github_review_id: Option<u64>,
     posted_at_unix: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RecordedFixAttempt {
+    repo: String,
+    pull_number: u64,
+    head_sha: String,
+    failed_contexts: Vec<String>,
+    attempted_at_unix: u64,
 }
 
 impl ReviewState {
@@ -549,10 +740,37 @@ impl ReviewState {
             },
         );
     }
+
+    fn record_fix_attempt(
+        &mut self,
+        repository: &RepoSlug,
+        pull: &PullRequest,
+        status: &PullRequestStatus,
+    ) {
+        let key = fix_state_key(repository, pull.number, &pull.head.sha);
+        self.fix_attempts.insert(
+            key,
+            RecordedFixAttempt {
+                repo: repository.as_path(),
+                pull_number: pull.number,
+                head_sha: pull.head.sha.clone(),
+                failed_contexts: status
+                    .failed_contexts
+                    .iter()
+                    .map(|context| context.name.clone())
+                    .collect(),
+                attempted_at_unix: now_unix_seconds(),
+            },
+        );
+    }
 }
 
 fn review_state_key(repository: &RepoSlug, number: u64) -> String {
     format!("{}#{}", repository.as_path(), number)
+}
+
+fn fix_state_key(repository: &RepoSlug, number: u64, head_sha: &str) -> String {
+    format!("{}#{}@{}", repository.as_path(), number, head_sha)
 }
 
 fn now_unix_seconds() -> u64 {
@@ -560,6 +778,56 @@ fn now_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn classify_pull_request_status(
+    combined: CombinedStatus,
+    check_runs: CheckRunsResponse,
+) -> PullRequestStatus {
+    let mut failed_contexts = Vec::new();
+    let mut pending_contexts = Vec::new();
+
+    for status in combined.statuses {
+        match status.state.as_str() {
+            "failure" | "error" => failed_contexts.push(FailedContext {
+                name: status.context,
+                kind: StatusContextKind::CommitStatus,
+                detail: status.description,
+                url: status.target_url,
+            }),
+            "pending" => pending_contexts.push(status.context),
+            _ => {}
+        }
+    }
+
+    if combined.state == "failure" && failed_contexts.is_empty() {
+        failed_contexts.push(FailedContext {
+            name: "combined commit status".to_string(),
+            kind: StatusContextKind::CommitStatus,
+            detail: Some("GitHub reported a failing combined commit status".to_string()),
+            url: None,
+        });
+    }
+
+    for check_run in check_runs.check_runs {
+        match check_run.conclusion.as_deref() {
+            Some("failure" | "timed_out" | "action_required" | "cancelled") => {
+                failed_contexts.push(FailedContext {
+                    name: check_run.name,
+                    kind: StatusContextKind::CheckRun,
+                    detail: check_run.conclusion,
+                    url: check_run.html_url,
+                });
+            }
+            _ if check_run.status != "completed" => pending_contexts.push(check_run.name),
+            _ => {}
+        }
+    }
+
+    PullRequestStatus {
+        failed_contexts,
+        pending_contexts,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -645,6 +913,151 @@ fn build_review_prompt(
     prompt
 }
 
+fn build_status_fix_prompt(
+    repository: &RepoSlug,
+    pull: &PullRequest,
+    status: &PullRequestStatus,
+) -> String {
+    let mut prompt = format!(
+        "You are Valkyrie, running in automatic PR status fix mode.\n\
+         The watch subcommand detected failing GitHub status contexts for this pull request.\n\
+         Diagnose the failing checks, make the smallest correct code or test changes, and run relevant validation.\n\
+         Leave any changes uncommitted and unpushed; Valkyrie will commit and push after you return.\n\
+         Do not create a new pull request. Do not modify unrelated files. Do not expose secrets in logs or commit messages.\n\n\
+         Repository: {repository}\n\
+         Pull request: #{}\n\
+         URL: {}\n\
+         Title: {}\n\
+         Author: {}\n\
+         Head repository: {}\n\
+         Head branch: {}\n\
+         Head sha: {}\n\n\
+         Failing contexts:\n",
+        pull.number,
+        pull.html_url,
+        pull.title,
+        pull.user.login,
+        pull.head
+            .repo
+            .as_ref()
+            .map(|repo| repo.full_name.as_str())
+            .unwrap_or("unavailable"),
+        pull.head.branch,
+        pull.head.sha
+    );
+
+    for context in &status.failed_contexts {
+        let kind = match context.kind {
+            StatusContextKind::CommitStatus => "commit status",
+            StatusContextKind::CheckRun => "check run",
+        };
+        prompt.push_str(&format!("- {} ({kind})", context.name));
+        if let Some(detail) = context.detail.as_deref() {
+            prompt.push_str(&format!(": {detail}"));
+        }
+        if let Some(url) = context.url.as_deref() {
+            prompt.push_str(&format!(" [{url}]"));
+        }
+        prompt.push('\n');
+    }
+
+    if !status.pending_contexts.is_empty() {
+        prompt.push_str("\nPending contexts:\n");
+        for context in &status.pending_contexts {
+            prompt.push_str(&format!("- {context}\n"));
+        }
+    }
+
+    prompt
+}
+
+fn commit_and_push_status_fix(
+    repository: &RepoSlug,
+    pull: &PullRequest,
+    head_repo: &PullRequestHeadRepo,
+    original_head: &str,
+) -> Result<bool, String> {
+    if worktree_has_changes()? {
+        run_git(["add", "-A"])?;
+        let message = status_fix_commit_message(repository, pull.number);
+        run_git(["commit", "-m", message.as_str()])?;
+    } else if git_head_sha()? == original_head {
+        return Ok(false);
+    }
+
+    let remote = push_remote_url(&head_repo.full_name);
+    let refspec = push_refspec(&pull.head.branch);
+    run_git(["push", remote.as_str(), refspec.as_str()])?;
+    Ok(true)
+}
+
+fn ensure_clean_worktree() -> Result<(), String> {
+    if worktree_has_changes()? {
+        return Err(
+            "cannot auto-fix PR status with uncommitted local changes in the current worktree"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn worktree_has_changes() -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map_err(|error| format!("cannot run `git status --porcelain`: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`git status --porcelain` failed: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn git_head_sha() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("cannot run `git rev-parse HEAD`: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("`git rev-parse HEAD` failed: {}", stderr.trim()));
+    }
+    String::from_utf8(output.stdout)
+        .map(|head| head.trim().to_string())
+        .map_err(|error| format!("`git rev-parse HEAD` returned non-UTF-8 output: {error}"))
+}
+
+fn run_git<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(args.as_slice())
+        .output()
+        .map_err(|error| format!("cannot run `git`: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "`git {}` failed: {}",
+        args.join(" "),
+        stderr.trim()
+    ))
+}
+
+fn status_fix_commit_message(repository: &RepoSlug, pull_number: u64) -> String {
+    format!("Fix PR status for {repository}#{pull_number}")
+}
+
+fn push_remote_url(head_repository: &str) -> String {
+    format!("https://github.com/{head_repository}.git")
+}
+
+fn push_refspec(head_branch: &str) -> String {
+    format!("HEAD:{head_branch}")
+}
+
 fn truncate_patch(patch: &str) -> String {
     const LIMIT: usize = 12_000;
     if patch.len() <= LIMIT {
@@ -660,19 +1073,34 @@ struct AnvilOptions {
     default_model: Option<String>,
     max_turns: u16,
     show_logs: bool,
+    permission_mode: &'static str,
+    write_files: bool,
+    terminal: bool,
 }
 
 fn anvil_review(options: &AnvilOptions, prompt: &str) -> Result<GeneratedReview, String> {
-    let cwd =
-        std::env::current_dir().map_err(|error| format!("cannot read current dir: {error}"))?;
-    let mut client = AcpClient::start(options)?;
-    client.initialize()?;
-    let session_id = client.new_session(&cwd)?;
-    client.set_config(&session_id, "permission_mode", "readOnly")?;
-    let response = client.prompt(&session_id, prompt)?;
+    let response = anvil_prompt(options, prompt, Some(review_schema()))?;
     let output = extract_structured_output(&response)?;
     serde_json::from_value(output)
         .map_err(|error| format!("Anvil returned invalid review JSON: {error}"))
+}
+
+fn anvil_run(options: &AnvilOptions, prompt: &str) -> Result<(), String> {
+    anvil_prompt(options, prompt, None).map(|_| ())
+}
+
+fn anvil_prompt(
+    options: &AnvilOptions,
+    prompt: &str,
+    structured_schema: Option<Value>,
+) -> Result<Value, String> {
+    let cwd =
+        std::env::current_dir().map_err(|error| format!("cannot read current dir: {error}"))?;
+    let mut client = AcpClient::start(options)?;
+    client.initialize(options)?;
+    let session_id = client.new_session(&cwd)?;
+    client.set_config(&session_id, "permission_mode", options.permission_mode)?;
+    client.prompt(&session_id, prompt, structured_schema)
 }
 
 fn extract_structured_output(response: &Value) -> Result<Value, String> {
@@ -756,12 +1184,15 @@ impl AcpClient {
         })
     }
 
-    fn initialize(&mut self) -> Result<(), String> {
+    fn initialize(&mut self, options: &AnvilOptions) -> Result<(), String> {
         let params = json!({
             "protocolVersion": 1,
             "clientCapabilities": {
-                "fs": { "readTextFile": true, "writeTextFile": false },
-                "terminal": false
+                "fs": {
+                    "readTextFile": true,
+                    "writeTextFile": options.write_files
+                },
+                "terminal": options.terminal
             },
             "clientInfo": {
                 "name": "valkyrie",
@@ -799,23 +1230,28 @@ impl AcpClient {
         .map(|_| ())
     }
 
-    fn prompt(&mut self, session_id: &str, prompt: &str) -> Result<Value, String> {
-        self.request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": prompt }],
-                "_meta": {
-                    "anvil": {
-                        "structuredOutput": {
-                            "schemaName": "valkyrie_pr_review",
-                            "allowCoercion": true,
-                            "schema": review_schema()
-                        }
+    fn prompt(
+        &mut self,
+        session_id: &str,
+        prompt: &str,
+        structured_schema: Option<Value>,
+    ) -> Result<Value, String> {
+        let mut params = json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt }]
+        });
+        if let Some(schema) = structured_schema {
+            params["_meta"] = json!({
+                "anvil": {
+                    "structuredOutput": {
+                        "schemaName": "valkyrie_pr_review",
+                        "allowCoercion": true,
+                        "schema": schema
                     }
                 }
-            }),
-        )
+            });
+        }
+        self.request("session/prompt", params)
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -930,6 +1366,15 @@ mod tests {
     }
 
     #[test]
+    fn builds_stable_fix_state_key_for_head_sha() {
+        let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
+        assert_eq!(
+            fix_state_key(&repo, 42, "abc123"),
+            "BrokkAi/valkyrie#42@abc123"
+        );
+    }
+
+    #[test]
     fn formats_repository_access_error_with_context() {
         let repo: RepoSlug = "BrokkAi/valkryrie".parse().expect("slug");
         let error = repository_access_error(&repo, "gh: Not Found (HTTP 404)");
@@ -966,6 +1411,184 @@ mod tests {
         let sanitized = sanitize_generated_review(review, &files).expect("sanitized review");
         assert_eq!(sanitized.comments.len(), 1);
         assert_eq!(sanitized.comments[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn classifies_failed_commit_statuses_and_check_runs() {
+        let status = classify_pull_request_status(
+            CombinedStatus {
+                state: "failure".to_string(),
+                statuses: vec![
+                    CommitStatus {
+                        state: "failure".to_string(),
+                        context: "lint".to_string(),
+                        description: Some("cargo clippy failed".to_string()),
+                        target_url: Some("https://example.test/status".to_string()),
+                    },
+                    CommitStatus {
+                        state: "pending".to_string(),
+                        context: "integration".to_string(),
+                        description: None,
+                        target_url: None,
+                    },
+                ],
+            },
+            CheckRunsResponse {
+                check_runs: vec![
+                    CheckRun {
+                        name: "fmt".to_string(),
+                        status: "completed".to_string(),
+                        conclusion: Some("success".to_string()),
+                        html_url: None,
+                    },
+                    CheckRun {
+                        name: "tests".to_string(),
+                        status: "completed".to_string(),
+                        conclusion: Some("failure".to_string()),
+                        html_url: Some("https://example.test/check".to_string()),
+                    },
+                ],
+            },
+        );
+
+        assert!(status.is_failing());
+        assert_eq!(status.summary(), "2 failing contexts, 1 pending");
+        assert_eq!(
+            status
+                .failed_contexts
+                .iter()
+                .map(|context| context.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lint", "tests"]
+        );
+        assert_eq!(status.pending_contexts, vec!["integration"]);
+    }
+
+    #[test]
+    fn classifies_pending_check_runs_without_failure() {
+        let status = classify_pull_request_status(
+            CombinedStatus {
+                state: "pending".to_string(),
+                statuses: Vec::new(),
+            },
+            CheckRunsResponse {
+                check_runs: vec![CheckRun {
+                    name: "tests".to_string(),
+                    status: "queued".to_string(),
+                    conclusion: None,
+                    html_url: None,
+                }],
+            },
+        );
+
+        assert!(!status.is_failing());
+        assert_eq!(status.pending_contexts, vec!["tests"]);
+    }
+
+    #[test]
+    fn builds_status_fix_prompt_with_failed_contexts() {
+        let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
+        let pull = PullRequest {
+            number: 7,
+            title: "Fix tests".to_string(),
+            body: None,
+            html_url: "https://github.com/BrokkAi/valkyrie/pull/7".to_string(),
+            user: GitHubUser {
+                login: "alice".to_string(),
+            },
+            head: PullRequestHead {
+                sha: "abc123".to_string(),
+                branch: "alice/fix-tests".to_string(),
+                repo: Some(PullRequestHeadRepo {
+                    full_name: "alice/valkyrie".to_string(),
+                }),
+            },
+        };
+        let status = PullRequestStatus {
+            failed_contexts: vec![FailedContext {
+                name: "CI / test".to_string(),
+                kind: StatusContextKind::CheckRun,
+                detail: Some("failure".to_string()),
+                url: Some("https://example.test/check".to_string()),
+            }],
+            pending_contexts: vec!["deploy preview".to_string()],
+        };
+
+        let prompt = build_status_fix_prompt(&repo, &pull, &status);
+
+        assert!(prompt.contains("automatic PR status fix mode"));
+        assert!(prompt.contains("Repository: BrokkAi/valkyrie"));
+        assert!(prompt.contains("Pull request: #7"));
+        assert!(prompt.contains("Head repository: alice/valkyrie"));
+        assert!(prompt.contains("Leave any changes uncommitted and unpushed"));
+        assert!(prompt.contains("- CI / test (check run): failure [https://example.test/check]"));
+        assert!(prompt.contains("- deploy preview"));
+    }
+
+    #[test]
+    fn builds_status_fix_prompt_without_head_repository() {
+        let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
+        let pull = PullRequest {
+            number: 7,
+            title: "Fix tests".to_string(),
+            body: None,
+            html_url: "https://github.com/BrokkAi/valkyrie/pull/7".to_string(),
+            user: GitHubUser {
+                login: "alice".to_string(),
+            },
+            head: PullRequestHead {
+                sha: "abc123".to_string(),
+                branch: "alice/fix-tests".to_string(),
+                repo: None,
+            },
+        };
+        let status = PullRequestStatus {
+            failed_contexts: vec![FailedContext {
+                name: "CI / test".to_string(),
+                kind: StatusContextKind::CheckRun,
+                detail: Some("failure".to_string()),
+                url: None,
+            }],
+            pending_contexts: Vec::new(),
+        };
+
+        let prompt = build_status_fix_prompt(&repo, &pull, &status);
+
+        assert!(prompt.contains("Head repository: unavailable"));
+    }
+
+    #[test]
+    fn deserializes_pull_request_with_deleted_head_repository() {
+        let pull: PullRequest = serde_json::from_value(json!({
+            "number": 7,
+            "title": "Fix tests",
+            "body": null,
+            "html_url": "https://github.com/BrokkAi/valkyrie/pull/7",
+            "user": { "login": "alice" },
+            "head": {
+                "sha": "abc123",
+                "ref": "alice/fix-tests",
+                "repo": null
+            }
+        }))
+        .expect("pull request with deleted head repository");
+
+        assert!(pull.head.repo.is_none());
+    }
+
+    #[test]
+    fn builds_status_fix_git_values() {
+        let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
+
+        assert_eq!(
+            status_fix_commit_message(&repo, 7),
+            "Fix PR status for BrokkAi/valkyrie#7"
+        );
+        assert_eq!(
+            push_remote_url("alice/valkyrie"),
+            "https://github.com/alice/valkyrie.git"
+        );
+        assert_eq!(push_refspec("alice/fix-tests"), "HEAD:alice/fix-tests");
     }
 
     #[test]
