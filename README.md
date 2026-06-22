@@ -68,7 +68,7 @@ For each poll, Valkyrie:
 
 `vk watch --auto-fix-status` opts in to automatic fix attempts for failing pull request status contexts. For each open pull request, Valkyrie reads the head commit's commit statuses and check runs. If any context has failed, Valkyrie asks Anvil to diagnose the failure, make the smallest correct change, and run relevant validation. Anvil is asked to leave changes uncommitted and unpushed.
 
-Before Anvil runs, Valkyrie verifies that the current local worktree is clean and that local `HEAD` matches the pull request head SHA. After Anvil returns, Valkyrie stages any changes, commits them with a status-fix message, and pushes `HEAD` to the pull request head repository and branch. The local Git credentials must be able to push to the pull request head repository. Pull requests whose head repository is unavailable, such as deleted forks, are skipped for automatic status fixes.
+Before Anvil runs, Valkyrie verifies that the current local worktree is clean, fetches the pull request head branch, and checks out the expected head SHA in a detached state. After Anvil returns, Valkyrie stages any changes, commits them with a status-fix message, pushes `HEAD` to the pull request head repository and branch, and restores the original local checkout. The local Git credentials must be able to fetch from and push to the pull request head repository. Pull requests whose head repository is unavailable, such as deleted forks, are skipped for automatic status fixes.
 
 To avoid repeated attempts against the same failing commit, fix attempts are recorded by repository, pull request number, and head SHA in `.valkyrie/reviews.json`. A new push creates a new head SHA and can be attempted on a later poll if status still fails.
 

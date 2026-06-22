@@ -251,15 +251,8 @@ fn poll_repository(
                         );
                         continue;
                     };
-                    ensure_clean_worktree()?;
-                    let local_head = git_head_sha()?;
-                    if local_head != pull.head.sha {
-                        println!(
-                            "skipping status fix for {repository}#{} because local HEAD {local_head} does not match PR head {}",
-                            pull.number, pull.head.sha
-                        );
-                        continue;
-                    }
+                    let original_checkout = prepare_status_fix_worktree(&pull, head_repo)?;
+                    let original_head = pull.head.sha.clone();
                     println!(
                         "fixing status for {repository}#{} with Anvil ({})",
                         pull.number,
@@ -275,7 +268,6 @@ fn poll_repository(
                         write_files: true,
                         terminal: true,
                     };
-                    let original_head = local_head;
                     anvil_run(&anvil, &prompt)?;
                     if commit_and_push_status_fix(repository, &pull, head_repo, &original_head)? {
                         println!("pushed status fix for {repository}#{}", pull.number);
@@ -285,6 +277,7 @@ fn poll_repository(
                             pull.number
                         );
                     }
+                    restore_checkout(&original_checkout)?;
                     state.record_fix_attempt(repository, &pull, &status);
                     state.save(state_path)?;
                     println!(
@@ -978,17 +971,73 @@ fn commit_and_push_status_fix(
     original_head: &str,
 ) -> Result<bool, String> {
     if worktree_has_changes()? {
-        run_git(["add", "-A"])?;
+        run_git(&["add", "-A"])?;
         let message = status_fix_commit_message(repository, pull.number);
-        run_git(["commit", "-m", message.as_str()])?;
+        run_git(&["commit", "-m", message.as_str()])?;
     } else if git_head_sha()? == original_head {
         return Ok(false);
     }
 
     let remote = push_remote_url(&head_repo.full_name);
     let refspec = push_refspec(&pull.head.branch);
-    run_git(["push", remote.as_str(), refspec.as_str()])?;
+    run_git(&["push", remote.as_str(), refspec.as_str()])?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum OriginalCheckout {
+    Branch(String),
+    Detached(String),
+}
+
+fn prepare_status_fix_worktree(
+    pull: &PullRequest,
+    head_repo: &PullRequestHeadRepo,
+) -> Result<OriginalCheckout, String> {
+    ensure_clean_worktree()?;
+    let original_checkout = current_checkout()?;
+    fetch_pull_head(head_repo, &pull.head.branch)?;
+    let fetched_head = git_rev_parse("FETCH_HEAD")?;
+    if fetched_head != pull.head.sha {
+        return Err(format!(
+            "fetched head {fetched_head} does not match PR head {}",
+            pull.head.sha
+        ));
+    }
+    run_git(&["checkout", "--quiet", "--detach", pull.head.sha.as_str()])?;
+    Ok(original_checkout)
+}
+
+fn current_checkout() -> Result<OriginalCheckout, String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|error| format!("cannot run `git symbolic-ref --quiet --short HEAD`: {error}"))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(|branch| OriginalCheckout::Branch(branch.trim().to_string()))
+            .map_err(|error| {
+                format!(
+                    "`git symbolic-ref --quiet --short HEAD` returned non-UTF-8 output: {error}"
+                )
+            });
+    }
+    Ok(OriginalCheckout::Detached(git_head_sha()?))
+}
+
+fn fetch_pull_head(head_repo: &PullRequestHeadRepo, head_branch: &str) -> Result<(), String> {
+    let remote = push_remote_url(&head_repo.full_name);
+    run_git(&["fetch", "--quiet", remote.as_str(), head_branch])
+}
+
+fn restore_checkout(original_checkout: &OriginalCheckout) -> Result<(), String> {
+    ensure_clean_worktree()?;
+    match original_checkout {
+        OriginalCheckout::Branch(branch) => run_git(&["checkout", "--quiet", branch.as_str()]),
+        OriginalCheckout::Detached(sha) => {
+            run_git(&["checkout", "--quiet", "--detach", sha.as_str()])
+        }
+    }
 }
 
 fn ensure_clean_worktree() -> Result<(), String> {
@@ -1017,22 +1066,29 @@ fn worktree_has_changes() -> Result<bool, String> {
 }
 
 fn git_head_sha() -> Result<String, String> {
+    git_rev_parse("HEAD")
+}
+
+fn git_rev_parse(revision: &str) -> Result<String, String> {
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", revision])
         .output()
-        .map_err(|error| format!("cannot run `git rev-parse HEAD`: {error}"))?;
+        .map_err(|error| format!("cannot run `git rev-parse {revision}`: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("`git rev-parse HEAD` failed: {}", stderr.trim()));
+        return Err(format!(
+            "`git rev-parse {revision}` failed: {}",
+            stderr.trim()
+        ));
     }
     String::from_utf8(output.stdout)
         .map(|head| head.trim().to_string())
-        .map_err(|error| format!("`git rev-parse HEAD` returned non-UTF-8 output: {error}"))
+        .map_err(|error| format!("`git rev-parse {revision}` returned non-UTF-8 output: {error}"))
 }
 
-fn run_git<const N: usize>(args: [&str; N]) -> Result<(), String> {
+fn run_git(args: &[&str]) -> Result<(), String> {
     let output = Command::new("git")
-        .args(args.as_slice())
+        .args(args)
         .output()
         .map_err(|error| format!("cannot run `git`: {error}"))?;
     if output.status.success() {
