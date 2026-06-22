@@ -98,6 +98,10 @@ struct WatchArgs {
     /// Show Anvil stderr logs while reviews are generated.
     #[arg(long)]
     show_anvil_logs: bool,
+
+    /// Show per-repository polling summaries.
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -218,21 +222,19 @@ fn poll_repository(
     state_path: &Path,
     state: &mut ReviewState,
 ) -> Result<(), String> {
-    println!("polling {repository}");
     let pulls = github.open_pull_requests(repository, args.limit)?;
+    let mut skipped_recorded = 0;
+    let mut skipped_existing_review = 0;
     for pull in pulls {
         let state_key = review_state_key(repository, pull.number);
         if state.reviews.contains_key(&state_key) {
-            println!("skipping {repository}#{}: already recorded", pull.number);
+            skipped_recorded += 1;
             continue;
         }
 
         let marker = repository.review_marker(pull.number);
         if github.review_already_posted(repository, pull.number, &viewer.login, &marker)? {
-            println!(
-                "skipping {repository}#{}: existing Valkyrie review found",
-                pull.number
-            );
+            skipped_existing_review += 1;
             state.record(repository, &pull, None);
             state.save(state_path)?;
             continue;
@@ -262,6 +264,13 @@ fn poll_repository(
         state.record(repository, &pull, posted.id);
         state.save(state_path)?;
         println!("posted review for {repository}#{}", pull.number);
+    }
+
+    if args.verbose {
+        println!(
+            "polled {repository}: {} already recorded, {} existing Valkyrie review(s)",
+            skipped_recorded, skipped_existing_review
+        );
     }
     Ok(())
 }
