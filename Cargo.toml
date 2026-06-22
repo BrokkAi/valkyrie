@@ -1,6 +1,6 @@
 [package]
 name = "brokk-valkryie"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "GitHub pull request watcher and reviewer powered by Anvil"
 readme = "README.md"
