@@ -40,6 +40,7 @@ vk watch BrokkAi/example --once
 vk watch BrokkAi/example --dry-run
 vk watch BrokkAi/example --state-dir /var/lib/valkyrie
 vk watch BrokkAi/example --anvil-binary /usr/local/bin/anvil --default-model codex::gpt-5
+vk watch BrokkAi/example --show-anvil-logs
 ```
 
 Run local checks:

@@ -94,6 +94,10 @@ struct WatchArgs {
     /// Maximum Anvil tool-calling turns per prompt.
     #[arg(long, default_value_t = 25)]
     max_turns: u16,
+
+    /// Show Anvil stderr logs while reviews are generated.
+    #[arg(long)]
+    show_anvil_logs: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -152,15 +156,16 @@ fn validate_slug_part(value: &str, label: &str) -> Result<(), String> {
 
 fn run_watch(args: WatchArgs) -> Result<(), String> {
     let repositories = merge_repositories(args.repos.clone(), args.positional_repos.clone())?;
+    let github = GitHubClient::new();
+    let viewer = github.current_user()?;
+    validate_repositories(&github, &repositories)?;
+
     fs::create_dir_all(&args.state_dir).map_err(|error| {
         format!(
             "cannot create state directory `{}`: {error}",
             args.state_dir.display()
         )
     })?;
-
-    let github = GitHubClient::new();
-    let viewer = github.current_user()?;
     let state_path = args.state_dir.join("reviews.json");
     let mut state = ReviewState::load(&state_path)?;
 
@@ -196,6 +201,13 @@ fn merge_repositories(
         }
     }
     Ok(repositories)
+}
+
+fn validate_repositories(github: &GitHubClient, repositories: &[RepoSlug]) -> Result<(), String> {
+    for repository in repositories {
+        github.validate_repository(repository)?;
+    }
+    Ok(())
 }
 
 fn poll_repository(
@@ -242,6 +254,7 @@ fn poll_repository(
             binary: args.anvil_binary.clone(),
             default_model: args.default_model.clone(),
             max_turns: args.max_turns,
+            show_logs: args.show_anvil_logs,
         };
         let generated = anvil_review(&anvil, &prompt)?;
         let review = sanitize_generated_review(generated, &files)?;
@@ -335,6 +348,13 @@ impl GitHubClient {
 
     fn current_user(&self) -> Result<GitHubUser, String> {
         self.get("/user")
+    }
+
+    fn validate_repository(&self, repository: &RepoSlug) -> Result<(), String> {
+        let endpoint = format!("/repos/{}/{}", repository.owner, repository.name);
+        self.get::<Value>(&endpoint)
+            .map(|_| ())
+            .map_err(|error| repository_access_error(repository, &error))
     }
 
     fn open_pull_requests(
@@ -462,6 +482,13 @@ fn decode_gh_output<T: for<'de> Deserialize<'de>>(
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cannot decode `gh api {endpoint}` response: {error}"))
+}
+
+fn repository_access_error(repository: &RepoSlug, error: &str) -> String {
+    format!(
+        "cannot access repository `{repository}` with `gh api`: {error}. \
+         Check that the repository exists and the authenticated GitHub user can read it."
+    )
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -623,6 +650,7 @@ struct AnvilOptions {
     binary: String,
     default_model: Option<String>,
     max_turns: u16,
+    show_logs: bool,
 }
 
 fn anvil_review(options: &AnvilOptions, prompt: &str) -> Result<GeneratedReview, String> {
@@ -692,7 +720,11 @@ impl AcpClient {
             .arg(options.max_turns.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(if options.show_logs {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
         if let Some(default_model) = options.default_model.as_deref() {
             command.arg("--default-model").arg(default_model);
         }
@@ -886,6 +918,16 @@ mod tests {
     fn builds_stable_review_state_key() {
         let repo: RepoSlug = "BrokkAi/valkyrie".parse().expect("slug");
         assert_eq!(review_state_key(&repo, 42), "BrokkAi/valkyrie#42");
+    }
+
+    #[test]
+    fn formats_repository_access_error_with_context() {
+        let repo: RepoSlug = "BrokkAi/valkryrie".parse().expect("slug");
+        let error = repository_access_error(&repo, "gh: Not Found (HTTP 404)");
+        assert!(error.contains("cannot access repository `BrokkAi/valkryrie`"));
+        assert!(error.contains("gh: Not Found (HTTP 404)"));
+        assert!(error.contains("repository exists"));
+        assert!(error.contains("authenticated GitHub user can read it"));
     }
 
     #[test]
