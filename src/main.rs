@@ -251,33 +251,7 @@ fn poll_repository(
                         );
                         continue;
                     };
-                    let original_checkout = prepare_status_fix_worktree(&pull, head_repo)?;
-                    let original_head = pull.head.sha.clone();
-                    println!(
-                        "fixing status for {repository}#{} with Anvil ({})",
-                        pull.number,
-                        status.summary()
-                    );
-                    let prompt = build_status_fix_prompt(repository, &pull, &status);
-                    let anvil = AnvilOptions {
-                        binary: args.anvil_binary.clone(),
-                        default_model: args.default_model.clone(),
-                        max_turns: args.max_turns,
-                        show_logs: args.show_anvil_logs,
-                        permission_mode: "default",
-                        write_files: true,
-                        terminal: true,
-                    };
-                    anvil_run(&anvil, &prompt)?;
-                    if commit_and_push_status_fix(repository, &pull, head_repo, &original_head)? {
-                        println!("pushed status fix for {repository}#{}", pull.number);
-                    } else {
-                        println!(
-                            "Anvil did not leave local changes for {repository}#{}",
-                            pull.number
-                        );
-                    }
-                    restore_checkout(&original_checkout)?;
+                    run_status_fix(repository, args, &pull, head_repo, &status)?;
                     state.record_fix_attempt(repository, &pull, &status);
                     state.save(state_path)?;
                     println!(
@@ -336,6 +310,60 @@ fn poll_repository(
         println!(
             "polled {repository}: {} already recorded, {} existing Valkyrie review(s), {} previous status fix attempt(s)",
             skipped_recorded, skipped_existing_review, skipped_fix_attempted
+        );
+    }
+    Ok(())
+}
+
+fn run_status_fix(
+    repository: &RepoSlug,
+    args: &WatchArgs,
+    pull: &PullRequest,
+    head_repo: &PullRequestHeadRepo,
+    status: &PullRequestStatus,
+) -> Result<(), String> {
+    let original_checkout = prepare_status_fix_worktree(pull, head_repo)?;
+    let result = run_prepared_status_fix(repository, args, pull, head_repo, status);
+    match (result, restore_checkout(&original_checkout)) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Err(error), Err(restore_error)) => Err(format!(
+            "{error}; additionally failed to restore original checkout: {restore_error}"
+        )),
+    }
+}
+
+fn run_prepared_status_fix(
+    repository: &RepoSlug,
+    args: &WatchArgs,
+    pull: &PullRequest,
+    head_repo: &PullRequestHeadRepo,
+    status: &PullRequestStatus,
+) -> Result<(), String> {
+    let original_head = pull.head.sha.clone();
+    println!(
+        "fixing status for {repository}#{} with Anvil ({})",
+        pull.number,
+        status.summary()
+    );
+    let prompt = build_status_fix_prompt(repository, pull, status);
+    let anvil = AnvilOptions {
+        binary: args.anvil_binary.clone(),
+        default_model: args.default_model.clone(),
+        max_turns: args.max_turns,
+        show_logs: args.show_anvil_logs,
+        permission_mode: "default",
+        write_files: true,
+        terminal: true,
+    };
+    anvil_run(&anvil, &prompt)?;
+    if commit_and_push_status_fix(repository, pull, head_repo, &original_head)? {
+        println!("pushed status fix for {repository}#{}", pull.number);
+    } else {
+        println!(
+            "Anvil did not leave local changes for {repository}#{}",
+            pull.number
         );
     }
     Ok(())
