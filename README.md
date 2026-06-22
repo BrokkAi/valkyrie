@@ -40,6 +40,7 @@ vk watch BrokkAi/example --once
 vk watch BrokkAi/example --dry-run
 vk watch BrokkAi/example --state-dir /var/lib/valkyrie
 vk watch BrokkAi/example --anvil-binary /usr/local/bin/anvil --default-model codex::gpt-5
+vk watch BrokkAi/example --auto-fix-status
 vk watch BrokkAi/example --show-anvil-logs
 vk watch BrokkAi/example --verbose
 ```
@@ -62,5 +63,15 @@ For each poll, Valkyrie:
 6. Sends pull request metadata and patches to Anvil over ACP.
 7. Posts a GitHub pull request review with a summary and inline comments.
 8. Records the pull request in `.valkyrie/reviews.json`.
+
+## Automatic Status Fixes
+
+`vk watch --auto-fix-status` opts in to automatic fix attempts for failing pull request status contexts. For each open pull request, Valkyrie reads the head commit's commit statuses and check runs. If any context has failed, Valkyrie asks Anvil to diagnose the failure, make the smallest correct change, and run relevant validation. Anvil is asked to leave changes uncommitted and unpushed.
+
+Before Anvil runs, Valkyrie verifies that the current local worktree is clean and that local `HEAD` matches the pull request head SHA. After Anvil returns, Valkyrie stages any changes, commits them with a status-fix message, and pushes `HEAD` to the pull request head repository and branch. The local Git credentials must be able to push to the pull request head repository. Pull requests whose head repository is unavailable, such as deleted forks, are skipped for automatic status fixes.
+
+To avoid repeated attempts against the same failing commit, fix attempts are recorded by repository, pull request number, and head SHA in `.valkyrie/reviews.json`. A new push creates a new head SHA and can be attempted on a later poll if status still fails.
+
+This mode is intentionally opt-in because it may modify code and push to remote pull request branches.
 
 Valkyrie is intentionally polling-based in v0.2.0. It does not run a webhook server.
