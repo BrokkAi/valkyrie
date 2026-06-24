@@ -396,34 +396,104 @@ fn run_prepared_status_fix(
 }
 
 fn run_doctor() -> Result<(), String> {
-    println!("gh: {}", command_status("gh"));
-    println!("anvil: {}", command_status("anvil"));
-    println!("brokk mcp default command: {}", command_status("uvx"));
-    println!("github api: {}", github_api_status());
+    print!(
+        "{}",
+        render_doctor_report(&build_doctor_report(command_status, github_api_status,))
+    );
     Ok(())
 }
 
-fn command_status(binary: &str) -> &'static str {
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DoctorReport {
+    dependencies: Vec<DependencyCheck>,
+    github_api: DependencyStatus,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DependencyCheck {
+    label: &'static str,
+    binary: &'static str,
+    status: DependencyStatus,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DependencyStatus {
+    Ok,
+    Missing,
+    Unavailable,
+}
+
+impl DependencyStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn build_doctor_report(
+    mut command_status: impl FnMut(&str) -> DependencyStatus,
+    github_api_status: impl FnOnce() -> DependencyStatus,
+) -> DoctorReport {
+    let dependencies = vec![
+        doctor_dependency("gh", "gh", &mut command_status),
+        doctor_dependency("anvil", "anvil", &mut command_status),
+        doctor_dependency("brokk mcp default command", "uvx", &mut command_status),
+    ];
+    DoctorReport {
+        dependencies,
+        github_api: github_api_status(),
+    }
+}
+
+fn doctor_dependency(
+    label: &'static str,
+    binary: &'static str,
+    command_status: &mut impl FnMut(&str) -> DependencyStatus,
+) -> DependencyCheck {
+    DependencyCheck {
+        label,
+        binary,
+        status: command_status(binary),
+    }
+}
+
+fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut output = String::new();
+    for dependency in &report.dependencies {
+        output.push_str(&format!(
+            "{}: {}\n",
+            dependency.label,
+            dependency.status.as_str()
+        ));
+    }
+    output.push_str(&format!("github api: {}\n", report.github_api.as_str()));
+    output
+}
+
+fn command_status(binary: &str) -> DependencyStatus {
     match Command::new(binary)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => "ok",
-        _ => "missing",
+        Ok(status) if status.success() => DependencyStatus::Ok,
+        _ => DependencyStatus::Missing,
     }
 }
 
-fn github_api_status() -> &'static str {
+fn github_api_status() -> DependencyStatus {
     match Command::new("gh")
         .args(["api", "/user", "--method", "GET"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => "ok",
-        _ => "unavailable",
+        Ok(status) if status.success() => DependencyStatus::Ok,
+        _ => DependencyStatus::Unavailable,
     }
 }
 
@@ -1658,6 +1728,71 @@ mod tests {
         assert!(error.contains("gh: Not Found (HTTP 404)"));
         assert!(error.contains("repository exists"));
         assert!(error.contains("authenticated GitHub user can read it"));
+    }
+
+    #[test]
+    fn builds_doctor_report_from_injected_checks() {
+        let mut checked = Vec::new();
+        let report = build_doctor_report(
+            |binary| {
+                checked.push(binary.to_string());
+                match binary {
+                    "gh" | "uvx" => DependencyStatus::Ok,
+                    "anvil" => DependencyStatus::Missing,
+                    other => panic!("unexpected binary check: {other}"),
+                }
+            },
+            || DependencyStatus::Unavailable,
+        );
+
+        assert_eq!(checked, vec!["gh", "anvil", "uvx"]);
+        assert_eq!(
+            report,
+            DoctorReport {
+                dependencies: vec![
+                    DependencyCheck {
+                        label: "gh",
+                        binary: "gh",
+                        status: DependencyStatus::Ok,
+                    },
+                    DependencyCheck {
+                        label: "anvil",
+                        binary: "anvil",
+                        status: DependencyStatus::Missing,
+                    },
+                    DependencyCheck {
+                        label: "brokk mcp default command",
+                        binary: "uvx",
+                        status: DependencyStatus::Ok,
+                    },
+                ],
+                github_api: DependencyStatus::Unavailable,
+            }
+        );
+    }
+
+    #[test]
+    fn renders_doctor_report() {
+        let report = DoctorReport {
+            dependencies: vec![
+                DependencyCheck {
+                    label: "gh",
+                    binary: "gh",
+                    status: DependencyStatus::Ok,
+                },
+                DependencyCheck {
+                    label: "anvil",
+                    binary: "anvil",
+                    status: DependencyStatus::Missing,
+                },
+            ],
+            github_api: DependencyStatus::Unavailable,
+        };
+
+        assert_eq!(
+            render_doctor_report(&report),
+            "gh: ok\nanvil: missing\ngithub api: unavailable\n"
+        );
     }
 
     #[test]
