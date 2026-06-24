@@ -14,6 +14,7 @@ cargo install brokk-valkryie
 
 - `gh` authenticated with `gh auth login`
 - `anvil` on `PATH`
+- `uvx` on `PATH` for the default Brokk MCP server command (`uvx brokk mcp`)
 - `gh api` access to read pull requests and write pull request reviews
 
 Valkyrie does not use webhooks. It polls the repositories passed at startup.
@@ -40,6 +41,8 @@ vk watch BrokkAi/example --once
 vk watch BrokkAi/example --dry-run
 vk watch BrokkAi/example --state-dir /var/lib/valkyrie
 vk watch BrokkAi/example --anvil-binary /usr/local/bin/anvil --default-model codex::gpt-5
+vk watch BrokkAi/example --brokk-mcp-command /opt/homebrew/bin/uvx --brokk-mcp-arg brokk --brokk-mcp-arg mcp
+vk watch BrokkAi/example --no-brokk-mcp
 vk watch BrokkAi/example --auto-fix-status
 vk watch BrokkAi/example --show-anvil-logs
 vk watch BrokkAi/example --verbose
@@ -60,9 +63,12 @@ For each poll, Valkyrie:
 3. Finds open pull requests.
 4. Skips pull requests already recorded in local state.
 5. Skips pull requests that already contain a Valkyrie review marker from the authenticated GitHub user.
-6. Sends pull request metadata and patches to Anvil over ACP.
-7. Posts a GitHub pull request review with a summary and inline comments.
-8. Records the pull request in `.valkyrie/reviews.json`.
+6. Sends pull request metadata and patches to Anvil over ACP with the Brokk MCP server attached by default.
+7. Asks Anvil to apply the Brokk `brokk-review-pr` workflow using Brokk/Bifrost MCP code intelligence.
+8. Posts a GitHub pull request review with a Brokk-style Markdown summary and inline comments.
+9. Records the pull request in `.valkyrie/reviews.json`.
+
+Anvil manages its canonical Bifrost MCP setup during session startup. Valkyrie adds the Brokk MCP server to review sessions by default with `uvx brokk mcp`; use `--brokk-mcp-command` and repeated `--brokk-mcp-arg` flags to customize that command, or `--no-brokk-mcp` to run without the extra Brokk MCP server.
 
 ## Automatic Status Fixes
 
