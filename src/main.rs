@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -6,9 +7,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{CommandFactory, Parser, Subcommand};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -22,6 +26,14 @@ generated content, posted on behalf of the authenticated GitHub user. It may con
 /// renders standalone in the diff view away from the review summary banner.
 const COMMENT_ATTRIBUTION: &str =
     "<sub>🤖 Automated comment by [Valkyrie](https://github.com/BrokkAi/valkyrie)</sub>";
+const GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const GITHUB_API_VERSION: &str = "2022-11-28";
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_GET_ATTEMPTS: usize = 3;
+const GITHUB_RETRY_DELAY: Duration = Duration::from_secs(2);
+const GITHUB_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const GITHUB_TOKEN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() {
     if let Err(error) = run() {
@@ -195,7 +207,7 @@ fn validate_slug_part(value: &str, label: &str) -> Result<(), String> {
 
 fn run_watch(args: WatchArgs) -> Result<(), String> {
     let repositories = merge_repositories(args.repos.clone(), args.positional_repos.clone())?;
-    let github = GitHubClient::new();
+    let github = GitHubClient::new()?;
     let viewer = github.current_user()?;
     validate_repositories(&github, &repositories)?;
 
@@ -541,7 +553,6 @@ fn build_doctor_report(
     github_api_status: impl FnOnce() -> DependencyStatus,
 ) -> DoctorReport {
     let dependencies = vec![
-        doctor_dependency("gh", "gh", &mut command_status),
         doctor_dependency("anvil", "anvil", &mut command_status),
         doctor_dependency("brokk mcp default command", "uvx", &mut command_status),
     ];
@@ -589,15 +600,9 @@ fn command_status(binary: &str) -> DependencyStatus {
 }
 
 fn github_api_status() -> DependencyStatus {
-    match Command::new("gh")
-        .args(["api", "/user", "--method", "GET"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => DependencyStatus::Ok,
-        _ => DependencyStatus::Unavailable,
-    }
+    GitHubClient::new()
+        .and_then(|client| client.current_user().map(|_| ()))
+        .map_or(DependencyStatus::Unavailable, |_| DependencyStatus::Ok)
 }
 
 #[derive(Debug, Deserialize)]
@@ -722,11 +727,28 @@ struct PostedReview {
     id: Option<u64>,
 }
 
-struct GitHubClient {}
+struct GitHubClient {
+    client: Client,
+    api_base_url: String,
+    token: String,
+}
 
 impl GitHubClient {
-    fn new() -> Self {
-        Self {}
+    fn new() -> Result<Self, String> {
+        Self::with_token(github_token()?)
+    }
+
+    fn with_token(token: String) -> Result<Self, String> {
+        let client = Client::builder()
+            .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+            .timeout(GITHUB_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| format!("cannot initialize GitHub HTTP client: {error}"))?;
+        Ok(Self {
+            client,
+            api_base_url: GITHUB_API_BASE_URL.to_string(),
+            token,
+        })
     }
 
     fn current_user(&self) -> Result<GitHubUser, String> {
@@ -859,11 +881,7 @@ impl GitHubClient {
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&self, endpoint: &str) -> Result<T, String> {
-        let output = Command::new("gh")
-            .args(["api", endpoint, "--method", "GET"])
-            .output()
-            .map_err(|error| format!("cannot run `gh api`: {error}"))?;
-        decode_gh_output(output, endpoint)
+        self.request(Method::GET, endpoint, None)
     }
 
     fn post<T: for<'de> Deserialize<'de>>(
@@ -871,43 +889,247 @@ impl GitHubClient {
         endpoint: &str,
         payload: Value,
     ) -> Result<T, String> {
-        let mut child = Command::new("gh")
-            .args(["api", endpoint, "--method", "POST", "--input", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot run `gh api`: {error}"))?;
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "cannot open `gh api` stdin".to_string())?;
-            serde_json::to_writer(stdin, &payload)
-                .map_err(|error| format!("cannot write GitHub API payload: {error}"))?;
+        self.request(Method::POST, endpoint, Some(payload))
+    }
+
+    fn request<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        payload: Option<Value>,
+    ) -> Result<T, String> {
+        let url = github_api_url(&self.api_base_url, endpoint)?;
+        let headers = github_headers(&self.token)?;
+        let attempts = if method == Method::GET {
+            GITHUB_GET_ATTEMPTS
+        } else {
+            1
+        };
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            let response = self
+                .send_request(method.clone(), &url, headers.clone(), payload.as_ref())
+                .map_err(|error| format!("cannot call GitHub API `{endpoint}`: {error}"))?;
+            let status = response.status();
+            let response_headers = response.headers().clone();
+            let body = response.text().map_err(|error| {
+                format!("cannot read GitHub API `{endpoint}` response: {error}")
+            })?;
+
+            if should_retry_github_get(status, &response_headers) && attempt < attempts {
+                last_error = Some(github_response_error(
+                    status,
+                    &response_headers,
+                    &body,
+                    endpoint,
+                ));
+                thread::sleep(github_retry_delay(&response_headers));
+                continue;
+            }
+
+            return decode_github_response(status, &response_headers, &body, endpoint);
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("cannot read `gh api` output: {error}"))?;
-        decode_gh_output(output, endpoint)
+
+        Err(last_error
+            .unwrap_or_else(|| format!("GitHub API `{endpoint}` failed without a response")))
+    }
+
+    fn send_request(
+        &self,
+        method: Method,
+        url: &str,
+        headers: HeaderMap,
+        payload: Option<&Value>,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        let mut request = self.client.request(method, url).headers(headers);
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        request.send()
     }
 }
 
-fn decode_gh_output<T: for<'de> Deserialize<'de>>(
-    output: std::process::Output,
+fn github_token() -> Result<String, String> {
+    github_token_from_sources(
+        github_token_from_gh_command(),
+        [
+            ("GH_TOKEN", env::var("GH_TOKEN").ok()),
+            ("GITHUB_TOKEN", env::var("GITHUB_TOKEN").ok()),
+        ],
+    )
+}
+
+fn github_token_from_sources<const N: usize>(
+    gh_token: Option<String>,
+    env_values: [(&'static str, Option<String>); N],
+) -> Result<String, String> {
+    if let Some(token) = gh_token.and_then(|token| trimmed_non_empty_token(&token)) {
+        return Ok(token);
+    }
+    github_token_from_values(env_values)
+}
+
+fn github_token_from_gh_command() -> Option<String> {
+    Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|child| wait_with_timeout(child, GITHUB_TOKEN_COMMAND_TIMEOUT))
+        .and_then(|output| github_token_from_gh_output(output.status.success(), &output.stdout))
+}
+
+fn github_token_from_gh_output(success: bool, stdout: &[u8]) -> Option<String> {
+    if !success {
+        return None;
+    }
+    trimmed_non_empty_token(&String::from_utf8_lossy(stdout))
+}
+
+fn github_token_from_values<const N: usize>(
+    values: [(&'static str, Option<String>); N],
+) -> Result<String, String> {
+    for (_, value) in values {
+        let Some(token) = value else {
+            continue;
+        };
+        if let Some(token) = trimmed_non_empty_token(&token) {
+            return Ok(token);
+        }
+    }
+    Err("GitHub authentication token is required; run `gh auth login` or set GH_TOKEN or GITHUB_TOKEN with a token that can read pull requests and write pull request reviews".to_string())
+}
+
+fn trimmed_non_empty_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<std::process::Output> {
+    let started = Instant::now();
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            return child.wait_with_output().ok();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn github_api_url(api_base_url: &str, endpoint: &str) -> Result<String, String> {
+    if !endpoint.starts_with('/') {
+        return Err(format!(
+            "GitHub API endpoint `{endpoint}` must start with `/`"
+        ));
+    }
+    Ok(format!("{}{endpoint}", api_base_url.trim_end_matches('/')))
+}
+
+fn github_headers(token: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("brokk-valkyrie"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static(GITHUB_API_VERSION),
+    );
+    let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|error| format!("cannot build GitHub authorization header: {error}"))?;
+    headers.insert(AUTHORIZATION, authorization);
+    Ok(headers)
+}
+
+fn should_retry_github_get(status: StatusCode, headers: &HeaderMap) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (status == StatusCode::FORBIDDEN && headers.contains_key(RETRY_AFTER))
+}
+
+fn github_retry_delay(headers: &HeaderMap) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .map(|delay| delay.min(GITHUB_MAX_RETRY_DELAY))
+        .unwrap_or(GITHUB_RETRY_DELAY)
+}
+
+fn decode_github_response<T: for<'de> Deserialize<'de>>(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
     endpoint: &str,
 ) -> Result<T, String> {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("`gh api {endpoint}` failed: {}", stderr.trim()));
+    if !status.is_success() {
+        return Err(github_response_error(status, headers, body, endpoint));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("cannot decode `gh api {endpoint}` response: {error}"))
+    serde_json::from_str(body)
+        .map_err(|error| format!("cannot decode GitHub API `{endpoint}` response: {error}"))
+}
+
+fn github_response_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+    endpoint: &str,
+) -> String {
+    let mut message = format!(
+        "GitHub API `{endpoint}` failed with HTTP {}: {}",
+        status.as_u16(),
+        github_error_body(body)
+    );
+    if let Some(retry_after) = header_string(headers, RETRY_AFTER.as_str()) {
+        message.push_str(&format!("; retry-after: {retry_after}"));
+    }
+    if let Some(reset) = header_string(headers, "x-ratelimit-reset") {
+        message.push_str(&format!("; x-ratelimit-reset: {reset}"));
+    }
+    if let Some(request_id) = header_string(headers, "x-github-request-id") {
+        message.push_str(&format!("; x-github-request-id: {request_id}"));
+    }
+    message
+}
+
+fn github_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "<empty response body>".to_string();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
 }
 
 fn repository_access_error(repository: &RepoSlug, error: &str) -> String {
     format!(
-        "cannot access repository `{repository}` with `gh api`: {error}. \
+        "cannot access repository `{repository}` with the GitHub API: {error}. \
          Check that the repository exists and the authenticated GitHub user can read it."
     )
 }
@@ -2010,11 +2232,113 @@ mod tests {
     #[test]
     fn formats_repository_access_error_with_context() {
         let repo: RepoSlug = "BrokkAi/valkryrie".parse().expect("slug");
-        let error = repository_access_error(&repo, "gh: Not Found (HTTP 404)");
+        let error = repository_access_error(
+            &repo,
+            "GitHub API `/repos/BrokkAi/valkryrie` failed with HTTP 404: Not Found",
+        );
         assert!(error.contains("cannot access repository `BrokkAi/valkryrie`"));
-        assert!(error.contains("gh: Not Found (HTTP 404)"));
+        assert!(error.contains("HTTP 404: Not Found"));
         assert!(error.contains("repository exists"));
         assert!(error.contains("authenticated GitHub user can read it"));
+    }
+
+    #[test]
+    fn prefers_github_cli_token_when_available() {
+        assert_eq!(
+            github_token_from_sources(
+                Some("  gh-token  ".to_string()),
+                [("GH_TOKEN", Some("env-token".to_string()))],
+            )
+            .expect("token"),
+            "gh-token"
+        );
+    }
+
+    #[test]
+    fn parses_github_cli_token_output() {
+        assert_eq!(
+            github_token_from_gh_output(true, b"  gh-token\n").as_deref(),
+            Some("gh-token")
+        );
+        assert_eq!(github_token_from_gh_output(true, b" \n"), None);
+        assert_eq!(github_token_from_gh_output(false, b"gh-token\n"), None);
+    }
+
+    #[test]
+    fn falls_back_to_supported_environment_token_names() {
+        assert_eq!(
+            github_token_from_sources(
+                None,
+                [
+                    ("GH_TOKEN", Some("  env-token  ".to_string())),
+                    ("GITHUB_TOKEN", Some("github-token".to_string())),
+                ],
+            )
+            .expect("token"),
+            "env-token"
+        );
+        assert_eq!(
+            github_token_from_sources(
+                Some(" ".to_string()),
+                [
+                    ("GH_TOKEN", Some(" ".to_string())),
+                    ("GITHUB_TOKEN", Some("github-token".to_string())),
+                ],
+            )
+            .expect("token"),
+            "github-token"
+        );
+        assert!(github_token_from_sources(None, [("GH_TOKEN", None)]).is_err());
+    }
+
+    #[test]
+    fn trims_non_empty_tokens_once() {
+        assert_eq!(
+            trimmed_non_empty_token("  github-token\n").as_deref(),
+            Some("github-token")
+        );
+        assert_eq!(trimmed_non_empty_token(" \n"), None);
+    }
+
+    #[test]
+    fn builds_github_api_urls_from_root_relative_endpoints() {
+        assert_eq!(
+            github_api_url("https://api.github.com/", "/user").expect("url"),
+            "https://api.github.com/user"
+        );
+        assert!(github_api_url("https://api.github.com", "user").is_err());
+    }
+
+    #[test]
+    fn decodes_github_error_messages() {
+        assert_eq!(
+            github_error_body(r#"{"message":"Bad credentials"}"#),
+            "Bad credentials"
+        );
+        assert_eq!(github_error_body("plain error"), "plain error");
+        assert_eq!(github_error_body(""), "<empty response body>");
+    }
+
+    #[test]
+    fn includes_github_retry_headers_in_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("60"));
+        headers.insert("x-ratelimit-reset", HeaderValue::from_static("1800000000"));
+        headers.insert("x-github-request-id", HeaderValue::from_static("ABC:123"));
+
+        let error = github_response_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            r#"{"message":"secondary rate limit"}"#,
+            "/user",
+        );
+
+        assert!(error.contains("HTTP 429: secondary rate limit"));
+        assert!(error.contains("retry-after: 60"));
+        assert!(error.contains("x-ratelimit-reset: 1800000000"));
+        assert!(error.contains("x-github-request-id: ABC:123"));
+        assert!(should_retry_github_get(StatusCode::FORBIDDEN, &headers));
+        assert_eq!(github_retry_delay(&headers), GITHUB_MAX_RETRY_DELAY);
     }
 
     #[test]
@@ -2024,7 +2348,7 @@ mod tests {
             |binary| {
                 checked.push(binary.to_string());
                 match binary {
-                    "gh" | "uvx" => DependencyStatus::Ok,
+                    "uvx" => DependencyStatus::Ok,
                     "anvil" => DependencyStatus::Missing,
                     other => panic!("unexpected binary check: {other}"),
                 }
@@ -2032,16 +2356,11 @@ mod tests {
             || DependencyStatus::Unavailable,
         );
 
-        assert_eq!(checked, vec!["gh", "anvil", "uvx"]);
+        assert_eq!(checked, vec!["anvil", "uvx"]);
         assert_eq!(
             report,
             DoctorReport {
                 dependencies: vec![
-                    DependencyCheck {
-                        label: "gh",
-                        binary: "gh",
-                        status: DependencyStatus::Ok,
-                    },
                     DependencyCheck {
                         label: "anvil",
                         binary: "anvil",
@@ -2061,24 +2380,17 @@ mod tests {
     #[test]
     fn renders_doctor_report() {
         let report = DoctorReport {
-            dependencies: vec![
-                DependencyCheck {
-                    label: "gh",
-                    binary: "gh",
-                    status: DependencyStatus::Ok,
-                },
-                DependencyCheck {
-                    label: "anvil",
-                    binary: "anvil",
-                    status: DependencyStatus::Missing,
-                },
-            ],
+            dependencies: vec![DependencyCheck {
+                label: "anvil",
+                binary: "anvil",
+                status: DependencyStatus::Missing,
+            }],
             github_api: DependencyStatus::Unavailable,
         };
 
         assert_eq!(
             render_doctor_report(&report),
-            "gh: ok\nanvil: missing\ngithub api: unavailable\n"
+            "anvil: missing\ngithub api: unavailable\n"
         );
     }
 

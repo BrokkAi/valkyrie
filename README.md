@@ -12,10 +12,9 @@ cargo install brokk-valkryie
 
 ## Requirements
 
-- `gh` authenticated with `gh auth login`
+- GitHub authentication from `gh auth login`, or `GH_TOKEN`/`GITHUB_TOKEN` set to a token that can read pull requests and write pull request reviews
 - `anvil` on `PATH`
 - `uvx` on `PATH` for the default Brokk MCP server command (`uvx brokk mcp`)
-- `gh api` access to read pull requests and write pull request reviews
 
 Valkyrie does not use webhooks. It polls the repositories passed at startup.
 
@@ -60,8 +59,8 @@ vk doctor
 
 For each poll, Valkyrie:
 
-1. Uses the GitHub authentication already configured for `gh`.
-2. Calls the GitHub REST API through `gh api` for the configured repositories.
+1. Uses the token from `gh auth token` when `gh` is available, otherwise `GH_TOKEN` or `GITHUB_TOKEN`.
+2. Calls the GitHub REST API directly for the configured repositories.
 3. Finds open pull requests.
 4. Skips pull requests already recorded in local state.
 5. Skips pull requests that already contain a Valkyrie review marker from the authenticated GitHub user.
