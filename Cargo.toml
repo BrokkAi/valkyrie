@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2024"
 description = "GitHub pull request watcher and reviewer powered by Anvil"
 readme = "README.md"
-license = "Apache-2.0"
+license = "GPL-3.0-only"
 repository = "https://github.com/BrokkAi/valkyrie"
 publish = true
 
